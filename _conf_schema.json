@@ -1,0 +1,8 @@
+{
+  "admin_only": {
+    "description": "所有 /llm 指令是否仅管理员可用。默认开启，非管理员调用会被拒绝。",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后群内所有成员都可使用 /llm 指令（包括切换模型），请谨慎操作。"
+  }
+}
