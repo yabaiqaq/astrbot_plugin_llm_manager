@@ -288,12 +288,17 @@ class Store:
     def build_catalog(self) -> list[dict[str, Any]]:
         """按 源 -> 实例 -> 模型 顺序生成全局编号目录。
 
+        序号按 api_base 排序后分配（同 api_base 下保持 source 原有顺序），
+        与 /llm list 显示顺序一致，避免序号跳号。
+
         每条：{num, model, modalities, instance_id, source_id, site, api_base,
         source_enabled, instance_enabled, disabled}
         """
         catalog: list[dict[str, Any]] = []
         num = 1
-        for src in self.sources():
+        # 按 api_base 排序（Python sorted 是稳定排序，同 api_base 下保持 source 原有顺序）
+        sorted_sources = sorted(self.sources(), key=lambda s: str(s.get("api_base", "")))
+        for src in sorted_sources:
             for inst in src.get("instances", []):
                 models = inst.get("models", []) or []
                 for m in models:
@@ -455,8 +460,6 @@ class Store:
 
         跳过没有 provider_source_id 的条目（如 dashscope agent_runner）。
         幂等：已存在的 source/instance/model 不重复创建。
-        注意：按 provider_source 的 id 匹配 source，每个 provider_source 保留独立的 key——
-        即使 api_base 相同，不同 key 对应中转后台不同的分组权限，不能合并。
         """
         sources_cfg = config.get("provider_sources", []) or []
         providers_cfg = config.get("provider", []) or []
