@@ -2,7 +2,7 @@ name: astrbot_plugin_llm_manager
 display_name: LLM 供应商管理
 short_desc: 三级分层管理 LLM 后端/分组/模型，支持指令全局切换
 desc: 把 AstrBot 的供应商配置收敛为一个虚拟 Provider：按 API Base URL → 实例(站名_分组名) → 模型 三级管理，新增模型分组不再新增供应商；/llm use 一条指令全局切换。
-version: v0.1.0
+version: v1.0
 author: yabaiqaq
 requirements:
   - Pillow>=10.0.0
