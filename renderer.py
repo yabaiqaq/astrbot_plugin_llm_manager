@@ -2,6 +2,7 @@
 
 渲染结构（从上到下）：
   标题栏：LLM 供应商管理 + 统计
+  当前使用中横幅：序号 + 模型名 + 实例id（醒目绿色）
   源卡片（一级）：base_url + 站名
     实例（二级）：实例 ID + 状态标签
       模型（三级）：[序号] 模型名 + 能力标签
@@ -19,6 +20,7 @@ WIDTH = 720
 PADDING = 16
 CARD_RADIUS = 14
 TITLE_HEIGHT = 68
+CURRENT_BANNER_H = 56
 SOURCE_HEADER_H = 46
 INSTANCE_HEADER_H = 38
 MODEL_ROW_H = 34
@@ -109,7 +111,7 @@ def _round_rect(draw: ImageDraw.ImageDraw, xy: tuple, radius: int, **kw: Any) ->
 # ---------- 高度计算 ----------
 
 def _calc_height(store: Any) -> int:
-    h = TITLE_HEIGHT + PADDING
+    h = TITLE_HEIGHT + PADDING + CURRENT_BANNER_H + CARD_GAP
     for src in store.sources():
         h += SOURCE_HEADER_H
         for inst in src.get("instances", []):
@@ -136,6 +138,12 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
     current_routed = store.resolve(umo=umo)
     current_instance_id = current_routed["instance"]["id"] if current_routed else ""
     current_model_name = current_routed["model_name"] if current_routed else ""
+    # 找到当前模型的全局序号
+    current_num = None
+    for item in catalog:
+        if item["instance_id"] == current_instance_id and item["model"] == current_model_name:
+            current_num = item["num"]
+            break
 
     height = _calc_height(store)
     img = Image.new("RGB", (WIDTH, height), BG)
@@ -166,6 +174,40 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
     sw = _text_width(draw, stat, f_subtitle)
     draw.text((WIDTH - PADDING - sw - 4, 24), stat, font=f_subtitle, fill="#E0E7FF")
     y = TITLE_HEIGHT + PADDING
+
+    # ===== 当前使用中横幅（醒目绿色）=====
+    banner_top = y
+    banner_bottom = y + CURRENT_BANNER_H
+    # 浅绿色背景 + 绿色边框
+    _round_rect(draw, (PADDING, banner_top, WIDTH - PADDING, banner_bottom),
+                10, fill="#E8F7E8", outline="#52C41A", width=2)
+    # 左侧绿色圆点 + "当前使用中"
+    draw.ellipse((PADDING + 18, banner_top + 20, PADDING + 30, banner_top + 32),
+                 fill="#52C41A")
+    draw.text((PADDING + 38, banner_top + 16), "当前使用中", font=f_source,
+              fill="#237804")
+    # 右侧：序号徽章 + 模型名 + 实例id
+    if current_num is not None and current_model_name:
+        # 序号徽章（绿色）
+        num_text = str(current_num)
+        nw = max(30, _text_width(draw, num_text, f_badge) + 14)
+        _round_rect(draw, (WIDTH - PADDING - 200 - nw, banner_top + 14,
+                           WIDTH - PADDING - 200, banner_top + CURRENT_BANNER_H - 14),
+                    6, fill="#52C41A")
+        ntx = WIDTH - PADDING - 200 - nw + (nw - _text_width(draw, num_text, f_badge)) // 2
+        draw.text((ntx, banner_top + 17), num_text, font=f_badge, fill="#FFFFFF")
+        # 模型名
+        model_text = _truncate(draw, current_model_name, f_source, 180)
+        draw.text((WIDTH - PADDING - 190, banner_top + 16), model_text,
+                  font=f_source, fill="#1A1B1C")
+        # 实例id（小字）
+        inst_text = _truncate(draw, current_instance_id, f_tag, 190)
+        draw.text((WIDTH - PADDING - 190, banner_top + 36), inst_text,
+                  font=f_tag, fill="#6B7280")
+    else:
+        draw.text((WIDTH - PADDING - 200, banner_top + 18), "（未配置模型）",
+                  font=f_source, fill="#9CA3AF")
+    y = banner_bottom + CARD_GAP
 
     # ===== 空态 =====
     if total_sources == 0:
