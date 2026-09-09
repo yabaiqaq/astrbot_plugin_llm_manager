@@ -9,6 +9,7 @@
         模型（四级）：[序号] 模型名 + 能力标签
 
 存储层每个 provider_source 独立（保留各自 key），显示层按 api_base 合并。
+序号分配与显示顺序均按 api_base 字母排序，保持一致。
 """
 from __future__ import annotations
 
@@ -115,12 +116,14 @@ def _round_rect(draw: ImageDraw.ImageDraw, xy: tuple, radius: int, **kw: Any) ->
 # ---------- 高度计算 ----------
 
 def _group_sources_by_api_base(store: Any) -> dict[str, list[dict[str, Any]]]:
-    """把所有 source 按 api_base 分组，保持原有顺序。"""
+    """把所有 source 按 api_base 分组，返回按 api_base 排序的有序 dict。
+    同 api_base 下保持 source 原有顺序。"""
     groups: dict[str, list[dict[str, Any]]] = {}
     for src in store.sources():
         api_base = str(src.get("api_base", ""))
         groups.setdefault(api_base, []).append(src)
-    return groups
+    # 按 api_base 字母排序，与 build_catalog 序号分配顺序一致
+    return dict(sorted(groups.items(), key=lambda x: x[0]))
 
 
 def _calc_height(store: Any) -> int:

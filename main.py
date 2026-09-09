@@ -114,7 +114,8 @@ def _modality_mark(modalities: list[str]) -> str:
 
 def _render_tree(store: Store, umo: str | None = None) -> str:
     """四级树形视图：Base URL -> 源(site) -> 实例(站名_分组名) -> 模型[序号]。
-    存储层每个 provider_source 独立（保留各自 key），显示层按 api_base 合并。"""
+    存储层每个 provider_source 独立（保留各自 key），显示层按 api_base 合并。
+    序号分配与显示顺序均按 api_base 字母排序，保持一致。"""
     lines: list[str] = []
     override_id = store.get_conversation_override(umo) if umo else None
     default_inst = store.data.get("default_instance", "")
@@ -125,11 +126,12 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
     cur_instance_id = current_routed["instance"]["id"] if current_routed else ""
     cur_model_name = current_routed["model_name"] if current_routed else ""
 
-    # 按 api_base 分组（保持原有顺序）
+    # 按 api_base 分组（保持原有顺序），然后按 api_base 字母排序，与序号分配顺序一致
     api_groups: dict[str, list[dict]] = {}
     for src in store.sources():
         api_base = str(src.get("api_base", ""))
         api_groups.setdefault(api_base, []).append(src)
+    api_groups = dict(sorted(api_groups.items(), key=lambda x: x[0]))
 
     for api_base, sources in api_groups.items():
         lines.append(f"🔗 {api_base}  ({len(sources)} 个源)")
