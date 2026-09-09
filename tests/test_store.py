@@ -79,6 +79,7 @@ class StoreTest(unittest.TestCase):
         s.set_conversation_override("umo-1", "DeepSeek_推理")
         self.assertTrue(s.remove_instance("DeepSeek_推理"))
         self.assertEqual(s.data["default_instance"], "")
+        self.assertEqual(s.data["default_model"], "")
         self.assertNotIn("umo-1", s.data["overrides"])
 
     # ---------- 三级：Model ----------

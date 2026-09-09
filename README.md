@@ -100,9 +100,9 @@
 | `/llm import` | 从系统配置(cmd_config.json)导入已有供应商，自动保留原默认模型 | 管理员 |
 | `/llm add <站名> <base_url> <key> [类型]` | 新增一级源 | 管理员 |
 | `/llm group add <站名> <分组名> [模型...]` | 新增分组实例 | 管理员 |
-| `/llm group rm \| enable \| disable <实例id>` | 管理实例 | 管理员 |
-| `/llm model add \| rm <实例id> <模型id>...` | 挂载/移除模型 | 管理员 |
-| `/llm enable \| disable <实例id>` | 启停实例 | 管理员 |
+| `/llm group rm\|enable\|disable <实例id>` | 管理实例 | 管理员 |
+| `/llm model add\|rm <实例id> <模型id>...` | 挂载/移除模型 | 管理员 |
+| `/llm enable\|disable <实例id>` | 启停实例 | 管理员 |
 | `/llm test <目标>` | 连通性与时延 | 管理员 |
 | `/llm help` | 查看指令帮助 | 管理员 |
 
