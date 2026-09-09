@@ -775,15 +775,35 @@ class LLMManagerPlugin(Star):
             return (item, False, 0.0, str(e))
 
     @llm.command("test")
-    async def llm_test(self, event: AstrMessageEvent, arg: str = ""):
+    async def llm_test(
+        self,
+        event: AstrMessageEvent,
+        arg: str = "",
+        _p1: str = "",
+        _p2: str = "",
+        _p3: str = "",
+        _p4: str = "",
+        _p5: str = "",
+        _p6: str = "",
+        _p7: str = "",
+        _p8: str = "",
+        _p9: str = "",
+    ):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
             yield deny
             return
 
         store = get_store()
-        # arg 包含指令后的全部文本，按空格分割得到所有目标
-        tokens = arg.split() if arg else []
+        # 兼容 AstrBot 两种参数传递方式：
+        # 方式一：arg 包含全部文本（"30 31 36"），其余 _p* 为空
+        # 方式二：arg 只含第一个（"30"），其余拆分到 _p1="31", _p2="36"
+        raw_parts = [arg, _p1, _p2, _p3, _p4, _p5, _p6, _p7, _p8, _p9]
+        tokens = []
+        for part in raw_parts:
+            if part:
+                tokens.extend(str(part).split())
+        logger.info("[LLM Manager] /llm test 参数解析 | raw=%r | tokens=%r", raw_parts, tokens)
 
         # 不带参数：测试当前正在使用的模型
         if not tokens:
