@@ -470,6 +470,55 @@ class LLMManagerPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @llm.command("resync")
+    async def llm_resync(self, event: AstrMessageEvent, arg: str = ""):
+        """/llm resync  从系统配置(cmd_config.json)完全重建，解决手动删除供应商后不同步的问题。"""
+        deny = self._deny_if_not_admin(event)
+        if deny is not None:
+            yield deny
+            return
+        store = get_store()
+        plugin_data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        candidates = [
+            plugin_data_dir.parent.parent / "cmd_config.json",
+            Path("/AstrBot/data/cmd_config.json"),
+            Path.home() / "data" / "cmd_config.json",
+        ]
+        config_path = None
+        for c in candidates:
+            if c.exists():
+                config_path = c
+                break
+        if config_path is None:
+            yield event.plain_result(
+                "未找到 cmd_config.json。已尝试路径：\n"
+                + "\n".join(f"  {c}" for c in candidates)
+            )
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                config = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            yield event.plain_result(f"读取 cmd_config.json 失败：{e}")
+            return
+        result = store.resync_from_astrbot_config(config)
+        lines = [
+            f"已从系统配置完全重建（{config_path.name}）：",
+            f"  重建前：{result['old_sources']} 个源 / {result['old_models']} 个模型",
+            f"  重建后：{result['new_sources']} 个源 / {result['new_models']} 个模型",
+        ]
+        if result["default_preserved"]:
+            lines.append("  ✅ 全局默认模型已保留")
+        else:
+            lines.append("  ⚠️ 原全局默认模型已不存在，已清空（用 /llm default <序号> 重新设置）")
+        if result["overrides_cleaned"]:
+            lines.append(f"  已清理 {result['overrides_cleaned']} 个无效会话切换")
+        if result["skipped"]:
+            lines.append(f"  跳过（非聊天模型）：{', '.join(result['skipped'])}")
+        lines.append("\n用 /llm list 查看最新配置。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @llm.command("group")
     async def llm_group(self, event: AstrMessageEvent, arg: str = ""):
         """/llm group add <站名> <分组名> [模型...]  新增二级实例（id=站名_分组名）。
@@ -592,6 +641,63 @@ class LLMManagerPlugin(Star):
         yield event.plain_result(
             f"已停用 {arg.strip()}。" if ok else f"未找到实例 {arg.strip()}。"
         )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @llm.command("rm")
+    async def llm_rm(self, event: AstrMessageEvent, arg: str = ""):
+        """/llm rm source <站名|源id>  删除一级源（含所有分组和模型）
+        /llm rm instance <实例id>  删除实例（同 /llm group rm）
+        /llm rm model <实例id> <模型id>  删除模型（同 /llm model rm）"""
+        deny = self._deny_if_not_admin(event)
+        if deny is not None:
+            yield deny
+            return
+        tokens = arg.split()
+        if not tokens:
+            yield event.plain_result(
+                "用法：\n"
+                "  /llm rm source <站名|源id>   删除一级源（含所有分组和模型）\n"
+                "  /llm rm instance <实例id>     删除实例\n"
+                "  /llm rm model <实例id> <模型id>  删除模型\n"
+                "注意：删除后立即生效，用 /llm list 查看。"
+            )
+            return
+        sub = tokens[0].lower()
+        store = get_store()
+        if sub == "source":
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/llm rm source <站名|源id>")
+                return
+            target = tokens[1]
+            ok = store.remove_source(target)
+            if ok:
+                yield event.plain_result(
+                    f"已删除一级源 {target}（含其下所有分组和模型）。\n"
+                    "用 /llm list 查看最新配置。"
+                )
+            else:
+                yield event.plain_result(f"未找到一级源 {target}（用 /llm list 查看站名/源id）。")
+            return
+        if sub == "instance":
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/llm rm instance <实例id>")
+                return
+            ok = store.remove_instance(tokens[1])
+            yield event.plain_result(
+                f"已删除实例 {tokens[1]}。" if ok else f"未找到实例 {tokens[1]}。"
+            )
+            return
+        if sub == "model":
+            if len(tokens) < 3:
+                yield event.plain_result("用法：/llm rm model <实例id> <模型id>")
+                return
+            n = store.remove_models(tokens[1], tokens[2:])
+            yield event.plain_result(
+                f"实例 {tokens[1]} 移除 {n} 个模型。" if n
+                else f"未找到可移除的模型（实例 {tokens[1]}）。"
+            )
+            return
+        yield event.plain_result(f"未知子命令 {sub!r}。支持：source / instance / model")
 
     # ---------- 运维 ----------
 

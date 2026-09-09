@@ -221,6 +221,24 @@ class Store:
                     return True
         return False
 
+    def remove_source(self, source_id: str) -> bool:
+        """删除一级源（包括其下所有实例和模型），并清理引用。"""
+        source = self.find_source(source_id)
+        if source is None:
+            # 也尝试按站名匹配
+            for src in self.sources():
+                if src.get("site") == source_id:
+                    source = src
+                    break
+        if source is None:
+            return False
+        # 清理该源下所有实例的引用
+        for inst in source.get("instances", []):
+            self._clear_references(inst.get("id", ""))
+        self.data["sources"].remove(source)
+        self.save()
+        return True
+
     def set_instance_enabled(self, instance_id: str, enabled: bool) -> bool:
         inst = self.find_instance(instance_id)
         if inst is None:
@@ -579,4 +597,70 @@ class Store:
             "total_models": len(self.build_catalog()),
             "original_default": original_default,
             "auto_default_set": auto_default_set,
+        }
+
+    # ---------- 手动同步（解决手动修改 cmd_config.json 后不同步的问题）----------
+
+    def resync_from_astrbot_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        """从 AstrBot 配置完全重建 sources（先清空再导入）。
+
+        用于用户手动在 WebUI 删除/修改供应商后，让插件配置与系统配置同步。
+        保留 default_instance/default_model（如果目标仍存在），清理无效 overrides。
+        """
+        # 1. 保存当前设置
+        old_default_instance = self.data.get("default_instance", "")
+        old_default_model = self.data.get("default_model", "")
+        old_overrides = dict(self.data.get("overrides", {}))
+        old_source_count = len(self.data["sources"])
+        old_model_count = len(self.build_catalog())
+
+        # 2. 清空 sources（保留 default/overrides 字段，后面恢复）
+        self.data["sources"] = []
+
+        # 3. 重新导入（import 是幂等的，此时 sources 为空，会全部新建）
+        result = self.import_from_astrbot_config(config)
+
+        # 4. 恢复 default（优先精确匹配 实例+模型，其次匹配实例，找不到则清空）
+        default_preserved = False
+        if old_default_instance:
+            catalog = self.build_catalog()
+            # 精确匹配
+            for item in catalog:
+                if item["instance_id"] == old_default_instance and item["model"] == old_default_model:
+                    self.data["default_instance"] = old_default_instance
+                    self.data["default_model"] = old_default_model
+                    default_preserved = True
+                    break
+            # 只匹配实例（用该实例第一个模型）
+            if not default_preserved:
+                for item in catalog:
+                    if item["instance_id"] == old_default_instance:
+                        self.data["default_instance"] = old_default_instance
+                        self.data["default_model"] = item["model"]
+                        default_preserved = True
+                        break
+            if not default_preserved:
+                self.data["default_instance"] = ""
+                self.data["default_model"] = ""
+
+        # 5. 清理无效 overrides（实例已被删除的）
+        valid_instances = {inst["id"] for inst in self.instances()}
+        cleaned_overrides = {
+            umo: iid for umo, iid in old_overrides.items()
+            if iid in valid_instances
+        }
+        self.data["overrides"] = cleaned_overrides
+        overrides_cleaned = len(old_overrides) - len(cleaned_overrides)
+
+        # 6. 保存
+        self.save()
+
+        return {
+            "old_sources": old_source_count,
+            "old_models": old_model_count,
+            "new_sources": result["total_sources"],
+            "new_models": result["total_models"],
+            "default_preserved": default_preserved,
+            "overrides_cleaned": overrides_cleaned,
+            "skipped": result["skipped"],
         }

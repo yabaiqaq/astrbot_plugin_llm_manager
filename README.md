@@ -42,6 +42,16 @@
 
 > 注意：导入必须在你把 default_provider_id 改成 LLM Manager 之前执行，否则原来的默认模型值已被覆盖，无法自动保留。
 
+### 0.1 手动修改后同步（重要）
+
+如果你**手动在 AstrBot WebUI 删除或修改了供应商**，插件的 `backends.json` 不会自动同步，`/llm list` 还会显示旧数据。此时执行：
+
+```
+/llm resync
+```
+
+会从 `cmd_config.json` **完全重建**插件配置（先清空再导入），同时保留你设置的全局默认模型（如果目标仍存在），清理无效的会话切换。重建后用 `/llm list` 查看最新配置。
+
 ### 1. 手动添加后端（一级源）
 
 ```
@@ -98,11 +108,13 @@
 | `/llm use <序号\|模型id\|实例id> [-c]` | 全局 / 会话切换；不带参数查看当前生效 | 管理员 |
 | `/llm default <目标>` | 设置全局默认 | 管理员 |
 | `/llm import` | 从系统配置(cmd_config.json)导入已有供应商，自动保留原默认模型 | 管理员 |
+| `/llm resync` | 从系统配置完全重建（解决手动删除供应商后不同步的问题） | 管理员 |
 | `/llm add <站名> <base_url> <key> [类型]` | 新增一级源 | 管理员 |
 | `/llm group add <站名> <分组名> [模型...]` | 新增分组实例 | 管理员 |
-| `/llm group rm\|enable\|disable <实例id>` | 管理实例 | 管理员 |
-| `/llm model add\|rm <实例id> <模型id>...` | 挂载/移除模型 | 管理员 |
-| `/llm enable\|disable <实例id>` | 启停实例 | 管理员 |
+| `/llm group rm \| enable \| disable <实例id>` | 管理实例 | 管理员 |
+| `/llm model add \| rm <实例id> <模型id>...` | 挂载/移除模型 | 管理员 |
+| `/llm rm source \| instance \| model <目标>` | 统一删除（源/实例/模型） | 管理员 |
+| `/llm enable \| disable <实例id>` | 启停实例 | 管理员 |
 | `/llm test <目标>` | 连通性与时延 | 管理员 |
 | `/llm help` | 查看指令帮助 | 管理员 |
 
