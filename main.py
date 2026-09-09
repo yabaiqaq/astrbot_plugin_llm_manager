@@ -750,6 +750,29 @@ class LLMManagerPlugin(Star):
 
     # ---------- /llm test ----------
 
+    async def _test_one_model(self, store: Store, item: dict) -> tuple:
+        """测试单个模型连通性与延迟。
+        返回 (item, success: bool, latency_ms: float, error_msg: str | None)
+        """
+        source = store.find_source(item["source_id"])
+        inst = store.find_instance(item["instance_id"])
+        if source is None or inst is None or item.get("disabled", False):
+            return (item, False, 0.0, "源或实例被停用")
+
+        from .manager_provider import LLMManagerProvider
+
+        provider = LLMManagerProvider({"model": item["model"], "type": "llm_manager"}, {})
+        backend = provider._backend_for(source)
+        provider._apply_model_to_backend(backend, item["model"])
+
+        start = time.time()
+        try:
+            await asyncio.wait_for(backend.test(), timeout=60)
+            cost = (time.time() - start) * 1000
+            return (item, True, cost, None)
+        except Exception as e:
+            return (item, False, 0.0, str(e))
+
     @llm.command("test")
     async def llm_test(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
@@ -757,45 +780,75 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        target = arg.strip()
         store = get_store()
-        item = store.find_in_catalog(target) if target else None
-        if item is None:
-            yield event.plain_result("用法：/llm test <序号|模型id|实例id>（/llm list 查看序号）")
+        tokens = arg.split()
+
+        # 不带参数：测试当前正在使用的模型
+        if not tokens:
+            routed = store.resolve(umo=event.unified_msg_origin)
+            if routed is None:
+                yield event.plain_result("尚未配置任何可用模型。")
+                return
+            # 从目录中找到当前模型的真实序号
+            cur_num = "?"
+            for c in store.build_catalog():
+                if c["instance_id"] == routed["instance"]["id"] and c["model"] == routed["model_name"]:
+                    cur_num = c["num"]
+                    break
+            item = {
+                "num": cur_num,
+                "model": routed["model_name"],
+                "instance_id": routed["instance"]["id"],
+                "source_id": routed["source"]["id"],
+                "modalities": routed["model_entry"].get("modalities", []),
+                "disabled": False,
+            }
+            _, success, latency, error = await self._test_one_model(store, item)
+            if success:
+                yield event.plain_result(
+                    f"当前使用：[{cur_num}] {item['model']}（{item['instance_id']}）\n"
+                    f"✅ 连通正常，耗时 {latency:.0f} ms"
+                )
+            else:
+                yield event.plain_result(
+                    f"当前使用：[{cur_num}] {item['model']}（{item['instance_id']}）\n"
+                    f"❌ 测试失败：{error}"
+                )
             return
 
-        # 直接从目录项构造路由（精确到 instance_id + model），
-        # 不走 store.resolve(req_model=...)——后者按模型名匹配，同名模型在多个实例下时会测错。
-        source = store.find_source(item["source_id"])
-        inst = store.find_instance(item["instance_id"])
-        if source is None or inst is None or item["disabled"]:
-            yield event.plain_result("该模型当前不可用（源或实例被停用）。")
-            return
-        routed = {
-            "source": source,
-            "instance": inst,
-            "model_name": item["model"],
-            "model_entry": {"name": item["model"], "modalities": item["modalities"]},
-        }
+        # 带一个或多个参数：逐个解析并并行测试
+        items = []
+        not_found = []
+        for target in tokens:
+            item = store.find_in_catalog(target)
+            if item is None:
+                not_found.append(target)
+            else:
+                items.append(item)
 
-        # 实例化 LLMManagerProvider 用于后端实例化与模型应用
-        from .manager_provider import LLMManagerProvider
-
-        provider = LLMManagerProvider({"model": item["model"], "type": "llm_manager"}, {})
-        backend = provider._backend_for(routed["source"])
-        # 用 _apply_model_to_backend 多管齐下设置模型（set_model + provider_config + 实例属性），
-        # 避免后端 test() 内部仍用配置里的旧模型
-        provider._apply_model_to_backend(backend, routed["model_name"])
-
-        start = time.time()
-        try:
-            await asyncio.wait_for(backend.test(), timeout=60)
-            cost = (time.time() - start) * 1000
+        if not items:
             yield event.plain_result(
-                f"✅ [{item['num']}] {item['model']}（{item['instance_id']}）连通正常，耗时 {cost:.0f} ms"
+                f"未找到任何目标：{', '.join(not_found)}\n"
+                "用法：/llm test <序号|模型id|实例id>...（/llm list 查看序号）"
             )
-        except Exception as e:
-            yield event.plain_result(f"❌ [{item['num']}] {item['model']} 测试失败：{e}")
+            return
+
+        # 并行测试所有模型
+        results = await asyncio.gather(*[self._test_one_model(store, item) for item in items])
+
+        # 汇总输出
+        lines = []
+        success_count = 0
+        for item, success, latency, error in results:
+            if success:
+                success_count += 1
+                lines.append(f"✅ [{item['num']}] {item['model']}（{item['instance_id']}） {latency:.0f} ms")
+            else:
+                lines.append(f"❌ [{item['num']}] {item['model']}（{item['instance_id']}） 失败：{error}")
+        if not_found:
+            lines.append(f"⚠️ 未找到：{', '.join(not_found)}")
+        lines.append(f"—— {success_count}/{len(results)} 成功 ——")
+        yield event.plain_result("\n".join(lines))
 
     # ---------- /llm help ----------
 
@@ -821,7 +874,7 @@ class LLMManagerPlugin(Star):
             "  /llm group rm|enable|disable <实例id>\n"
             "  /llm model add|rm <实例id> <模型id>...    挂载/移除模型\n"
             "运维：\n"
-            "  /llm test <目标>           连通性与时延测试\n"
+            "  /llm test [目标...]         连通性与时延测试；不带参数测当前模型，可带多个目标批量测\n"
             "配置存放：data/plugin_data/astrbot_plugin_llm_manager/backends.json"
         )
         yield event.plain_result(help_text)
