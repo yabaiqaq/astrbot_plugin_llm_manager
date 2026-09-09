@@ -753,20 +753,21 @@ class LLMManagerPlugin(Star):
     async def _test_one_model(self, store: Store, item: dict) -> tuple:
         """测试单个模型连通性与延迟。
         返回 (item, success: bool, latency_ms: float, error_msg: str | None)
+        所有异常均内部捕获，确保不会向上抛出影响批量测试。
         """
         source = store.find_source(item["source_id"])
         inst = store.find_instance(item["instance_id"])
         if source is None or inst is None or item.get("disabled", False):
             return (item, False, 0.0, "源或实例被停用")
 
-        from .manager_provider import LLMManagerProvider
-
-        provider = LLMManagerProvider({"model": item["model"], "type": "llm_manager"}, {})
-        backend = provider._backend_for(source)
-        provider._apply_model_to_backend(backend, item["model"])
-
-        start = time.time()
         try:
+            from .manager_provider import LLMManagerProvider
+
+            provider = LLMManagerProvider({"model": item["model"], "type": "llm_manager"}, {})
+            backend = provider._backend_for(source)
+            provider._apply_model_to_backend(backend, item["model"])
+
+            start = time.time()
             await asyncio.wait_for(backend.test(), timeout=60)
             cost = (time.time() - start) * 1000
             return (item, True, cost, None)
@@ -774,14 +775,20 @@ class LLMManagerPlugin(Star):
             return (item, False, 0.0, str(e))
 
     @llm.command("test")
-    async def llm_test(self, event: AstrMessageEvent, arg: str = ""):
+    async def llm_test(self, event: AstrMessageEvent, arg: str = "", *args):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
             yield deny
             return
 
         store = get_store()
-        tokens = arg.split()
+        # 合并 arg 和额外位置参数（兼容 AstrBot 两种参数传递方式：
+        # 方式一 arg 包含全部文本；方式二 arg 只含第一个，其余进 *args）
+        raw_parts = [arg] + list(args)
+        tokens = []
+        for part in raw_parts:
+            if part:
+                tokens.extend(str(part).split())
 
         # 不带参数：测试当前正在使用的模型
         if not tokens:
@@ -833,8 +840,18 @@ class LLMManagerPlugin(Star):
             )
             return
 
-        # 并行测试所有模型
-        results = await asyncio.gather(*[self._test_one_model(store, item) for item in items])
+        # 并行测试所有模型（return_exceptions 确保单个异常不中断整体）
+        raw_results = await asyncio.gather(
+            *[self._test_one_model(store, item) for item in items],
+            return_exceptions=True,
+        )
+        # 归一化结果：gather 返回的异常对象转成 (item, False, 0, error_msg)
+        results = []
+        for i, r in enumerate(raw_results):
+            if isinstance(r, Exception):
+                results.append((items[i], False, 0.0, str(r)))
+            else:
+                results.append(r)
 
         # 汇总输出
         lines = []
