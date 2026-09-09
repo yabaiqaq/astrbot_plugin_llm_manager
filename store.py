@@ -455,6 +455,8 @@ class Store:
 
         跳过没有 provider_source_id 的条目（如 dashscope agent_runner）。
         幂等：已存在的 source/instance/model 不重复创建。
+        注意：按 provider_source 的 id 匹配 source，每个 provider_source 保留独立的 key——
+        即使 api_base 相同，不同 key 对应中转后台不同的分组权限，不能合并。
         """
         sources_cfg = config.get("provider_sources", []) or []
         providers_cfg = config.get("provider", []) or []
@@ -478,12 +480,9 @@ class Store:
             if not src_id or not api_base:
                 continue
 
-            # 查找或创建 Source（按 api_base 匹配，避免重复）
-            source = None
-            for s in self.data["sources"]:
-                if str(s.get("api_base", "")).rstrip("/") == api_base:
-                    source = s
-                    break
+            # 查找或创建 Source（按 provider_source 的 id 匹配，每个 provider_source 都是独立的 source，
+            # 保留自己的 key——即使 api_base 相同，不同 key 对应中转后台不同的分组权限）
+            source = self.find_source(src_id)
 
             if source is None:
                 source = {
@@ -501,6 +500,16 @@ class Store:
                 }
                 self.data["sources"].append(source)
                 imported_sources += 1
+            else:
+                # 已存在的 source，同步更新 key/api_base/type/启停（防止用户在 WebUI 改了配置）
+                source["key"] = list(src_cfg.get("key", []) or [])
+                source["api_base"] = api_base
+                source["type"] = str(src_cfg.get("type", "openai_chat_completion"))
+                source["provider_type"] = str(src_cfg.get("provider_type", "chat_completion"))
+                source["timeout"] = int(src_cfg.get("timeout", 120))
+                source["proxy"] = str(src_cfg.get("proxy", ""))
+                source["custom_headers"] = dict(src_cfg.get("custom_headers", {}) or {})
+                source["enabled"] = bool(src_cfg.get("enable", True))
 
             # 查找或创建 Instance（id=源ID，即提供商源唯一 ID）
             instance = None
