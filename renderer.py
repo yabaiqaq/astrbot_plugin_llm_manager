@@ -2,10 +2,13 @@
 
 渲染结构（从上到下）：
   标题栏：LLM 供应商管理 + 统计
-  当前使用中横幅：序号 + 模型名 + 实例id（醒目绿色）
-  源卡片（一级）：base_url + 站名
-    实例（二级）：实例 ID + 状态标签
-      模型（三级）：[序号] 模型名 + 能力标签
+  当前使用中横幅（醒目绿色）
+  API Base 卡片（一级）：base_url + 源数量
+    源小标题（二级）：site + 类型
+      实例（三级）：实例 ID + 状态标签
+        模型（四级）：[序号] 模型名 + 能力标签
+
+存储层每个 provider_source 独立（保留各自 key），显示层按 api_base 合并。
 """
 from __future__ import annotations
 
@@ -21,8 +24,9 @@ PADDING = 16
 CARD_RADIUS = 14
 TITLE_HEIGHT = 68
 CURRENT_BANNER_H = 56
-SOURCE_HEADER_H = 46
-INSTANCE_HEADER_H = 38
+API_BASE_HEADER_H = 46
+SOURCE_SUBHEADER_H = 32
+INSTANCE_ROW_H = 34
 MODEL_ROW_H = 34
 CARD_GAP = 14
 FOOTER_H = 24
@@ -110,14 +114,26 @@ def _round_rect(draw: ImageDraw.ImageDraw, xy: tuple, radius: int, **kw: Any) ->
 
 # ---------- 高度计算 ----------
 
+def _group_sources_by_api_base(store: Any) -> dict[str, list[dict[str, Any]]]:
+    """把所有 source 按 api_base 分组，保持原有顺序。"""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for src in store.sources():
+        api_base = str(src.get("api_base", ""))
+        groups.setdefault(api_base, []).append(src)
+    return groups
+
+
 def _calc_height(store: Any) -> int:
     h = TITLE_HEIGHT + PADDING + CURRENT_BANNER_H + CARD_GAP
-    for src in store.sources():
-        h += SOURCE_HEADER_H
-        for inst in src.get("instances", []):
-            h += INSTANCE_HEADER_H
-            models = inst.get("models", []) or []
-            h += MODEL_ROW_H * max(len(models), 1)
+    api_groups = _group_sources_by_api_base(store)
+    for api_base, sources in api_groups.items():
+        h += API_BASE_HEADER_H  # api_base 卡片标题
+        for src in sources:
+            h += SOURCE_SUBHEADER_H  # source 小标题（site）
+            for inst in src.get("instances", []):
+                h += INSTANCE_ROW_H  # 实例行
+                models = inst.get("models", []) or []
+                h += MODEL_ROW_H * max(len(models), 1)
         h += CARD_GAP
     h += FOOTER_H
     return h
@@ -126,7 +142,7 @@ def _calc_height(store: Any) -> int:
 # ---------- 主渲染 ----------
 
 def render_catalog_image(store: Any, umo: str | None = None) -> str:
-    """渲染三级目录为 PNG 图片，返回临时文件路径。"""
+    """渲染目录为 PNG 图片，返回临时文件路径。"""
     catalog = store.build_catalog()
     total_models = len(catalog)
     total_sources = len(store.sources())
@@ -178,7 +194,7 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
     # ===== 当前使用中横幅（醒目绿色）=====
     banner_top = y
     banner_bottom = y + CURRENT_BANNER_H
-    # 浅绿色背景 + 绿色边框
+    # 浅绿色背景
     _round_rect(draw, (PADDING, banner_top, WIDTH - PADDING, banner_bottom),
                 10, fill="#E8F7E8", outline="#52C41A", width=2)
     # 左侧绿色圆点 + "当前使用中"
@@ -188,7 +204,7 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
               fill="#237804")
     # 右侧：序号徽章 + 模型名 + 实例id
     if current_num is not None and current_model_name:
-        # 序号徽章（绿色）
+        # 序号徽章
         num_text = str(current_num)
         nw = max(30, _text_width(draw, num_text, f_badge) + 14)
         _round_rect(draw, (WIDTH - PADDING - 200 - nw, banner_top + 14,
@@ -222,131 +238,145 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
         draw.text(((WIDTH - hw) // 2, y + 58), hint, font=f_tag, fill=TEXT_MUTED)
         return _save(img)
 
-    # ===== 源卡片 =====
-    for src in store.sources():
-        src_enabled = src.get("enabled", True)
-        insts = src.get("instances", [])
-        card_h = SOURCE_HEADER_H
-        for inst in insts:
-            card_h += INSTANCE_HEADER_H
-            models = inst.get("models", []) or []
-            card_h += MODEL_ROW_H * max(len(models), 1)
+    # ===== API Base 卡片（按 api_base 分组，同 api_base 下多个 source 合并显示）=====
+    api_groups = _group_sources_by_api_base(store)
+    for api_base, sources in api_groups.items():
+        # 计算卡片高度
+        card_h = API_BASE_HEADER_H
+        for src in sources:
+            card_h += SOURCE_SUBHEADER_H
+            for inst in src.get("instances", []):
+                card_h += INSTANCE_ROW_H
+                models = inst.get("models", []) or []
+                card_h += MODEL_ROW_H * max(len(models), 1)
 
         card_top = y
         card_bottom = y + card_h
         _round_rect(draw, (PADDING, card_top, WIDTH - PADDING, card_bottom),
                     CARD_RADIUS, fill=CARD_BG, outline=CARD_BORDER)
 
-        # --- 源标题（一级）---
+        # --- API Base 标题（一级）---
         header_y = card_top
-        api_base = str(src.get("api_base", "?"))
-        site = str(src.get("site", ""))
-        base_text = _truncate(draw, api_base, f_source, WIDTH - PADDING * 2 - 120)
-        draw.text((PADDING + 14, header_y + 13), base_text, font=f_source,
-                  fill=TEXT_PRIMARY if src_enabled else DISABLED_TEXT)
-        # 站名 + 类型
-        site_tag = f"{site} · {src.get('type', '?')}"
-        site_tag = _truncate(draw, site_tag, f_source_small, 180)
-        stw = _text_width(draw, site_tag, f_source_small)
-        draw.text((WIDTH - PADDING - stw - 14, header_y + 16), site_tag,
-                  font=f_source_small, fill=TEXT_MUTED if src_enabled else DISABLED_TEXT)
+        base_text = _truncate(draw, api_base or "?", f_source, WIDTH - PADDING * 2 - 120)
+        draw.text((PADDING + 14, header_y + 13), base_text, font=f_source, fill=TEXT_PRIMARY)
+        # 源数量
+        src_count_tag = f"{len(sources)} 个源"
+        stw = _text_width(draw, src_count_tag, f_source_small)
+        draw.text((WIDTH - PADDING - stw - 14, header_y + 16), src_count_tag,
+                  font=f_source_small, fill=TEXT_MUTED)
         # 分隔线
-        draw.line([(PADDING + 10, header_y + SOURCE_HEADER_H - 1),
-                   (WIDTH - PADDING - 10, header_y + SOURCE_HEADER_H - 1)],
+        draw.line([(PADDING + 10, header_y + API_BASE_HEADER_H - 1),
+                   (WIDTH - PADDING - 10, header_y + API_BASE_HEADER_H - 1)],
                   fill="#F0F2F5")
 
-        iy = header_y + SOURCE_HEADER_H
+        iy = header_y + API_BASE_HEADER_H
 
-        # --- 实例（二级）---
-        for inst in insts:
-            inst_id = str(inst.get("id", "?"))
-            inst_enabled = inst.get("enabled", True) and src_enabled
-            is_default = (inst_id == default_inst and default_model == "")
-            is_override = (inst_id == override_id)
-            row_bg = HIGHLIGHT_BG if (is_default or is_override) else None
+        # --- 每个 source（二级小标题，显示 site）---
+        for src in sources:
+            src_enabled = src.get("enabled", True)
+            site = str(src.get("site", ""))
+            # source 小标题
+            sub_header_text = f"└─ {site}"
+            draw.text((PADDING + 20, iy + 6), sub_header_text, font=f_instance,
+                      fill=TEXT_SECONDARY if src_enabled else DISABLED_TEXT)
+            # 类型标签
+            type_tag = str(src.get("type", "?"))
+            type_tag = _truncate(draw, type_tag, f_tag, 140)
+            ttw = _text_width(draw, type_tag, f_tag)
+            draw.text((WIDTH - PADDING - ttw - 14, iy + 9), type_tag,
+                      font=f_tag, fill=TEXT_MUTED if src_enabled else DISABLED_TEXT)
+            iy += SOURCE_SUBHEADER_H
 
-            if row_bg:
-                draw.rectangle([PADDING + 1, iy, WIDTH - PADDING - 1,
-                                iy + INSTANCE_HEADER_H], fill=row_bg)
+            # --- 实例（三级）---
+            for inst in src.get("instances", []):
+                inst_id = str(inst.get("id", "?"))
+                inst_enabled = inst.get("enabled", True) and src_enabled
+                is_default = (inst_id == default_inst and default_model == "")
+                is_override = (inst_id == override_id)
+                row_bg = HIGHLIGHT_BG if (is_default or is_override) else None
 
-            draw.text((PADDING + 28, iy + 9), "└─", font=f_instance,
-                      fill=TEXT_MUTED if inst_enabled else DISABLED_TEXT)
-            inst_text = _truncate(draw, inst_id, f_instance, WIDTH - PADDING * 2 - 200)
-            draw.text((PADDING + 52, iy + 9), inst_text, font=f_instance,
-                      fill=TEXT_PRIMARY if inst_enabled else DISABLED_TEXT)
-
-            # 状态标签
-            tag_x = PADDING + 52 + _text_width(draw, inst_text, f_instance) + 8
-            if is_override:
-                _draw_tag(draw, tag_x, iy + 10, "本会话", f_tag, ACCENT, "#FFFFFF")
-                tag_x += 60
-            elif is_default:
-                _draw_tag(draw, tag_x, iy + 10, "默认", f_tag, SUCCESS, "#FFFFFF")
-                tag_x += 48
-            if not inst_enabled:
-                _draw_tag(draw, tag_x, iy + 10, "停用", f_tag, "#D9D9D9", "#999999")
-
-            iy += INSTANCE_HEADER_H
-
-            # --- 模型（三级）---
-            models = inst.get("models", []) or []
-            if not models:
-                draw.text((PADDING + 64, iy + 8), "（暂无模型）", font=f_model,
-                          fill=TEXT_MUTED)
-                iy += MODEL_ROW_H
-                continue
-
-            for item in catalog:
-                if item["instance_id"] != inst_id:
-                    continue
-                model_name = item["model"]
-                disabled = item["disabled"]
-                is_cur = (not disabled and inst_id == current_instance_id
-                          and model_name == current_model_name)
-                mrow_bg = HIGHLIGHT_BG if is_cur else None
-                if mrow_bg:
+                if row_bg:
                     draw.rectangle([PADDING + 1, iy, WIDTH - PADDING - 1,
-                                    iy + MODEL_ROW_H], fill=mrow_bg)
+                                    iy + INSTANCE_ROW_H], fill=row_bg)
 
-                # 序号徽章
-                badge_text = str(item["num"])
-                bw = max(26, _text_width(draw, badge_text, f_badge) + 12)
-                _round_rect(draw, (PADDING + 64, iy + 6,
-                                   PADDING + 64 + bw, iy + MODEL_ROW_H - 6),
-                            6, fill=BADGE_BG if not disabled else "#D9D9D9")
-                btx = PADDING + 64 + (bw - _text_width(draw, badge_text, f_badge)) // 2
-                draw.text((btx, iy + 8), badge_text, font=f_badge, fill=BADGE_TEXT)
+                draw.text((PADDING + 44, iy + 7), "└─", font=f_model,
+                          fill=TEXT_MUTED if inst_enabled else DISABLED_TEXT)
+                inst_text = _truncate(draw, inst_id, f_model, WIDTH - PADDING * 2 - 200)
+                draw.text((PADDING + 68, iy + 7), inst_text, font=f_model,
+                          fill=TEXT_PRIMARY if inst_enabled else DISABLED_TEXT)
 
-                # 模型名
-                mx = PADDING + 64 + bw + 10
-                model_text = _truncate(draw, model_name, f_model,
-                                        WIDTH - mx - PADDING - 120)
-                draw.text((mx, iy + 8), model_text, font=f_model,
-                          fill=TEXT_PRIMARY if not disabled else DISABLED_TEXT)
+                # 状态标签
+                tag_x = PADDING + 68 + _text_width(draw, inst_text, f_model) + 8
+                if is_override:
+                    _draw_tag(draw, tag_x, iy + 8, "本会话", f_tag, ACCENT, "#FFFFFF")
+                    tag_x += 60
+                elif is_default:
+                    _draw_tag(draw, tag_x, iy + 8, "默认", f_tag, SUCCESS, "#FFFFFF")
+                    tag_x += 48
+                if not inst_enabled:
+                    _draw_tag(draw, tag_x, iy + 8, "停用", f_tag, "#D9D9D9", "#999999")
 
-                # 能力标签
-                mods = item.get("modalities", [])
-                tag_x2 = mx + _text_width(draw, model_text, f_model) + 8
-                if "tool_use" in mods:
-                    _draw_tag(draw, tag_x2, iy + 9, "工具", f_tag, TAG_BG, TAG_TEXT)
-                    tag_x2 += 42
-                if "image" in mods:
-                    _draw_tag(draw, tag_x2, iy + 9, "视觉", f_tag, TAG_BG, TAG_TEXT)
-                    tag_x2 += 42
-                if "audio" in mods:
-                    _draw_tag(draw, tag_x2, iy + 9, "语音", f_tag, TAG_BG, TAG_TEXT)
+                iy += INSTANCE_ROW_H
 
-                # 当前使用中标记（绿色圆点 + 文字，醒目）
-                if is_cur:
-                    _draw_tag(draw, WIDTH - PADDING - 78, iy + 8, "● 使用中",
-                              f_tag, "#52C41A", "#FFFFFF")
-                elif disabled:
-                    dis_text = "停用"
-                    dw = _text_width(draw, dis_text, f_tag)
-                    draw.text((WIDTH - PADDING - dw - 14, iy + 10), dis_text,
-                              font=f_tag, fill=DISABLED_TEXT)
+                # --- 模型（四级）---
+                models = inst.get("models", []) or []
+                if not models:
+                    draw.text((PADDING + 80, iy + 8), "（暂无模型）", font=f_model,
+                              fill=TEXT_MUTED)
+                    iy += MODEL_ROW_H
+                    continue
 
-                iy += MODEL_ROW_H
+                for item in catalog:
+                    if item["instance_id"] != inst_id:
+                        continue
+                    model_name = item["model"]
+                    disabled = item["disabled"]
+                    is_cur = (not disabled and inst_id == current_instance_id
+                              and model_name == current_model_name)
+                    mrow_bg = HIGHLIGHT_BG if is_cur else None
+                    if mrow_bg:
+                        draw.rectangle([PADDING + 1, iy, WIDTH - PADDING - 1,
+                                        iy + MODEL_ROW_H], fill=mrow_bg)
+
+                    # 序号徽章
+                    badge_text = str(item["num"])
+                    bw = max(26, _text_width(draw, badge_text, f_badge) + 12)
+                    _round_rect(draw, (PADDING + 80, iy + 6,
+                                       PADDING + 80 + bw, iy + MODEL_ROW_H - 6),
+                                6, fill=BADGE_BG if not disabled else "#D9D9D9")
+                    btx = PADDING + 80 + (bw - _text_width(draw, badge_text, f_badge)) // 2
+                    draw.text((btx, iy + 8), badge_text, font=f_badge, fill=BADGE_TEXT)
+
+                    # 模型名
+                    mx = PADDING + 80 + bw + 10
+                    model_text = _truncate(draw, model_name, f_model,
+                                            WIDTH - mx - PADDING - 120)
+                    draw.text((mx, iy + 8), model_text, font=f_model,
+                              fill=TEXT_PRIMARY if not disabled else DISABLED_TEXT)
+
+                    # 能力标签
+                    mods = item.get("modalities", [])
+                    tag_x2 = mx + _text_width(draw, model_text, f_model) + 8
+                    if "tool_use" in mods:
+                        _draw_tag(draw, tag_x2, iy + 9, "工具", f_tag, TAG_BG, TAG_TEXT)
+                        tag_x2 += 42
+                    if "image" in mods:
+                        _draw_tag(draw, tag_x2, iy + 9, "视觉", f_tag, TAG_BG, TAG_TEXT)
+                        tag_x2 += 42
+                    if "audio" in mods:
+                        _draw_tag(draw, tag_x2, iy + 9, "语音", f_tag, TAG_BG, TAG_TEXT)
+
+                    # 当前使用中标记
+                    if is_cur:
+                        _draw_tag(draw, WIDTH - PADDING - 78, iy + 8, "● 使用中",
+                                  f_tag, "#52C41A", "#FFFFFF")
+                    elif disabled:
+                        dis_text = "停用"
+                        dw = _text_width(draw, dis_text, f_tag)
+                        draw.text((WIDTH - PADDING - dw - 14, iy + 10), dis_text,
+                                  font=f_tag, fill=DISABLED_TEXT)
+
+                    iy += MODEL_ROW_H
 
         y = card_bottom + CARD_GAP
 

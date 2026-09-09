@@ -113,7 +113,8 @@ def _modality_mark(modalities: list[str]) -> str:
 
 
 def _render_tree(store: Store, umo: str | None = None) -> str:
-    """三级树形视图：Base URL -> 实例(站名_分组名) -> 模型[序号]。"""
+    """四级树形视图：Base URL -> 源(site) -> 实例(站名_分组名) -> 模型[序号]。
+    存储层每个 provider_source 独立（保留各自 key），显示层按 api_base 合并。"""
     lines: list[str] = []
     override_id = store.get_conversation_override(umo) if umo else None
     default_inst = store.data.get("default_instance", "")
@@ -124,42 +125,49 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
     cur_instance_id = current_routed["instance"]["id"] if current_routed else ""
     cur_model_name = current_routed["model_name"] if current_routed else ""
 
+    # 按 api_base 分组（保持原有顺序）
+    api_groups: dict[str, list[dict]] = {}
     for src in store.sources():
-        insts = src.get("instances", [])
-        status = "（停用）" if not src.get("enabled", True) else ""
-        lines.append(f"🔗 {src.get('api_base', '?')}  ({src.get('site', '?')}){status}")
-        for inst in insts:
-            inst_id = inst.get("id", "")
-            marks = []
-            if inst.get("enabled", True) is False:
-                marks.append("停用")
-            elif not src.get("enabled", True):
-                marks.append("源停用")
-            if inst_id == default_inst and default_model == "":
-                marks.append("← 默认")
-            if inst_id == override_id:
-                marks.append("← 本会话")
-            mark_txt = f"  [{' '.join(marks)}]" if marks else ""
-            lines.append(f" └─ {inst_id}{mark_txt}")
-            models = inst.get("models", [])
-            if not models:
-                lines.append("     （暂无模型，用 /llm model add 挂载）")
-                continue
-            for item in store.build_catalog():
-                if item["instance_id"] != inst_id:
+        api_base = str(src.get("api_base", ""))
+        api_groups.setdefault(api_base, []).append(src)
+
+    for api_base, sources in api_groups.items():
+        lines.append(f"🔗 {api_base}  ({len(sources)} 个源)")
+        for src in sources:
+            src_status = "（停用）" if not src.get("enabled", True) else ""
+            lines.append(f" └─ {src.get('site', '?')}  [{src.get('type', '?')}]{src_status}")
+            for inst in src.get("instances", []):
+                inst_id = inst.get("id", "")
+                marks = []
+                if inst.get("enabled", True) is False:
+                    marks.append("停用")
+                elif not src.get("enabled", True):
+                    marks.append("源停用")
+                if inst_id == default_inst and default_model == "":
+                    marks.append("← 默认")
+                if inst_id == override_id:
+                    marks.append("← 本会话")
+                mark_txt = f"  [{' '.join(marks)}]" if marks else ""
+                lines.append(f"    └─ {inst_id}{mark_txt}")
+                models = inst.get("models", [])
+                if not models:
+                    lines.append("        （暂无模型，用 /llm model add 挂载）")
                     continue
-                dis = "（停用）" if item["disabled"] else ""
-                cur = ""
-                if (
-                    not dis
-                    and inst_id == cur_instance_id
-                    and item["model"] == cur_model_name
-                ):
-                    cur = "  ● 使用中"
-                lines.append(
-                    f"     ├─ [{item['num']}] {item['model']}"
-                    f"{_modality_mark(item['modalities'])}{dis}{cur}"
-                )
+                for item in store.build_catalog():
+                    if item["instance_id"] != inst_id:
+                        continue
+                    dis = "（停用）" if item["disabled"] else ""
+                    cur = ""
+                    if (
+                        not dis
+                        and inst_id == cur_instance_id
+                        and item["model"] == cur_model_name
+                    ):
+                        cur = "  ● 使用中"
+                    lines.append(
+                        f"        ├─ [{item['num']}] {item['model']}"
+                        f"{_modality_mark(item['modalities'])}{dis}{cur}"
+                    )
 
     if not store.sources():
         lines.append("（尚未配置任何后端。示例：/llm add DeepSeek https://api.deepseek.com/v1 sk-xxx）")
