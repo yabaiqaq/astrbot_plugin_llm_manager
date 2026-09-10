@@ -201,9 +201,9 @@ def _resolve_and_apply(
         cleared = store.clear_conversation_override(umo)
         cur = store.data.get("default_instance", "")
         return (
-            f"已清除本会话切换，回到全局默认：{cur or '（未设置）'}。"
+            f"已清除本会话切换，回到全局默认：{cur or '（未设置）'}"
             if cleared
-            else f"本会话本就没有独立切换，全局默认：{cur or '（未设置）'}。"
+            else f"本会话本就没有独立切换，全局默认：{cur or '（未设置）'}"
         )
 
     item = store.find_in_catalog(target)
@@ -748,6 +748,77 @@ class LLMManagerPlugin(Star):
 
         yield event.plain_result(f"未知子命令 {sub!r}。支持：source / instance / model")
 
+    # ---------- /llm stats ----------
+
+    @llm.command("stats")
+    async def llm_stats(self, event: AstrMessageEvent, arg: str = ""):
+        """查看各模型 Token 消耗排行。
+
+        参数：
+          （无）  默认最近 7 天
+          1d     最近 1 天
+          7d     最近 7 天
+          30d    最近 30 天
+          all    全部历史（受 30 天保留期限制）
+        """
+        deny = self._deny_if_not_admin(event)
+        if deny is not None:
+            yield deny
+            return
+
+        store = get_store()
+
+        # 解析时间范围参数
+        arg_lower = arg.strip().lower()
+        days_map = {
+            "1d": 1, "1": 1, "day": 1, "today": 1,
+            "7d": 7, "7": 7, "week": 7,
+            "30d": 30, "30": 30, "month": 30,
+            "all": None, "total": None, "全部": None,
+        }
+        days = days_map.get(arg_lower, 7)  # 默认 7 天
+
+        range_text = "全部历史" if days is None else f"最近 {days} 天"
+        items = store.stats.aggregate(days)
+
+        if not items:
+            yield event.plain_result(
+                f"📊 {range_text} 暂无 Token 消耗记录。\n"
+                "（统计功能刚启用，需要一些对话后才会有数据；"
+                "目前仅统计非流式对话，流式对话暂不记录）"
+            )
+            return
+
+        total_calls = sum(i["calls"] for i in items)
+        total_tokens = sum(i["total_tokens"] for i in items)
+
+        lines = [
+            f"📊 {range_text} 模型 Token 消耗排行",
+            "━" * 30,
+        ]
+
+        for idx, item in enumerate(items, 1):
+            model = item["model"]
+            instance = item["instance"]
+            calls = item["calls"]
+            prompt = item["prompt_tokens"]
+            completion = item["completion_tokens"]
+            total = item["total_tokens"]
+
+            lines.append(f"{idx}. {model}（{instance}）")
+            lines.append(f"   总 Token: {total:,} | 调用: {calls} 次")
+            lines.append(f"   输入: {prompt:,} | 输出: {completion:,}")
+            if idx < len(items):
+                lines.append("")
+
+        lines.append("━" * 30)
+        lines.append(f"合计: {total_tokens:,} Token | {total_calls} 次调用")
+        lines.append("")
+        lines.append("提示: /llm stats 1d | 7d | 30d | all  切换时间范围")
+        lines.append("（仅统计非流式对话，流式对话暂不记录）")
+
+        yield event.plain_result("\n".join(lines))
+
     # ---------- /llm test ----------
 
     async def _test_one_model(self, store: Store, item: dict) -> tuple:
@@ -906,7 +977,8 @@ class LLMManagerPlugin(Star):
             "  /llm group rm|enable|disable <实例id>\n"
             "  /llm model add|rm <实例id> <模型id>...    挂载/移除模型\n"
             "运维：\n"
-            "  /llm test [目标...]         连通性与时延测试；不带参数测当前模型，可带多个目标批量测\n"
+            "  /llm stats [1d|7d|30d|all]  各模型 Token 消耗排行\n"
+            "  /llm test <目标>           连通性与时延测试\n"
             "配置存放：data/plugin_data/astrbot_plugin_llm_manager/backends.json"
         )
         yield event.plain_result(help_text)
