@@ -22,12 +22,10 @@
 
 ---
 
-## 安装
+## 安装配置
 
-> ⚠️ **顺序很重要**：先 `/llmm import` 导入（此时 cmd_config.json 里还是你原来的默认模型），再去 WebUI 把 default_provider_id 改成 LLM Manager。如果先改了 default_provider_id，原来的默认模型值就丢失了，导入时无法自动保留。
-
-1. 把 `astrbot_plugin_llm_manager` 文件夹放入 AstrBot 的插件目录（`data/plugins/`，或用 WebUI 插件管理导入）。
-2. **重启 AstrBot**（或重载插件）。启动后插件会自动注册一个新提供商类型 **LLM Manager**。
+1. 安装本插件。
+2. 启动后插件会自动注册一个新提供商类型 **LLM Manager**。
 3. 在 QQ 里发 **`/llmm import`**，从系统配置一键导入已有供应商和模型。导入时会自动读取你原来的 `default_provider_id` 并设为插件全局默认，确保安装后默认模型不变。
 4. 打开 WebUI → **服务提供商**：
    - 新增提供商：类型选 **LLM Manager**，`id` 随意（如 `llm_manager`），`key` 留空，保存。
