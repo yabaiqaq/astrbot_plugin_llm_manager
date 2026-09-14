@@ -3,7 +3,7 @@
 设计：AstrBot 中只注册一个虚拟 Provider（LLM Manager），全部真实后端、
 分组与模型由插件自己的 backends.json 管理；指令层提供三级查看与全局切换。
 
-指令集（全部以 /llm 开头）：
+指令集（全部以 /llmm 开头）：
   list    三级查看（默认图片卡片，-t 纯文本）
   use     全局/会话切换（序号/模型ID/实例ID）
   default 查看/设置全局默认
@@ -125,7 +125,7 @@ def _modality_mark(modalities: list[str] | None) -> str:
 
 
 def _render_tree(store: Store, umo: str | None = None) -> str:
-    """纯文本三级树渲染（/llm list -t 使用）。"""
+    """纯文本三级树渲染（/llmm list -t 使用）。"""
     lines: list[str] = []
 
     override_id = store.get_conversation_override(umo) if umo else None
@@ -165,7 +165,7 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
 
                 models = inst.get("models", [])
                 if not models:
-                    lines.append("        （暂无模型，用 /llm model add 挂载）")
+                    lines.append("        （暂无模型，用 /llmm model add 挂载）")
                     continue
                 for item in store.build_catalog():
                     if item["instance_id"] != inst_id:
@@ -181,7 +181,7 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
 
     if not store.sources():
         lines.append(
-            "（尚未配置任何后端。示例：/llm add DeepSeek https://api.deepseek.com/v1 sk-xxx）"
+            "（尚未配置任何后端。示例：/llmm add DeepSeek https://api.deepseek.com/v1 sk-xxx）"
         )
 
     total = len(store.build_catalog())
@@ -209,7 +209,7 @@ def _resolve_and_apply(
     item = store.find_in_catalog(target)
     if item is None:
         return (
-            f"未找到目标 {target!r}。可用：模型序号（/llm list 查看）、模型 ID、"
+            f"未找到目标 {target!r}。可用：模型序号（/llmm list 查看）、模型 ID、"
             "实例 ID（站名_分组名）。"
         )
 
@@ -274,19 +274,19 @@ class LLMManagerPlugin(Star):
         """非管理员时返回拒绝消息，管理员返回 None。"""
         if not self._is_allowed(event):
             return event.plain_result(
-                "/llm 指令仅管理员可用。如需放开，请在插件配置中关闭 admin_only。"
+                "/llmm 指令仅管理员可用。如需放开，请在插件配置中关闭 admin_only。"
             )
         return None
 
     # ---------- 指令组 ----------
 
-    @filter.command_group("llm")
-    def llm(self):
+    @filter.command_group("llmm")
+    def llmm(self):
         pass
 
-    # ---------- /llm list ----------
+    # ---------- /llmm list ----------
 
-    @llm.command("list")
+    @llmm.command("list")
     async def llm_list(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -335,9 +335,9 @@ class LLMManagerPlugin(Star):
             except OSError:
                 pass
 
-    # ---------- /llm use ----------
+    # ---------- /llmm use ----------
 
-    @llm.command("use")
+    @llmm.command("use")
     async def llm_use(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -364,25 +364,25 @@ class LLMManagerPlugin(Star):
                     + (f" / {default_model}" if default_model else " / 实例首个模型"),
                     f"  会话切换：{override_id or '（无）'}",
                     "",
-                    "用法：/llm use <序号|模型id|实例id> [-c]",
+                    "用法：/llmm use <序号|模型id|实例id> [-c]",
                     "  不带 -c：全局切换；带 -c：仅当前会话；use global 恢复全局默认。",
                 ]
                 if not default_inst and not override_id:
                     lines.append("")
                     lines.append(
                         "⚠️ 未设置全局默认，当前用的是兜底（第一个启用模型）。"
-                        "建议 /llm default <序号> 设定。"
+                        "建议 /llmm default <序号> 设定。"
                     )
                 yield event.plain_result("\n".join(lines))
             else:
-                yield event.plain_result("尚未配置模型。请先 /llm import 或 /llm add 添加后端。")
+                yield event.plain_result("尚未配置模型。请先 /llmm import 或 /llmm add 添加后端。")
             return
 
         yield event.plain_result(_resolve_and_apply(store, event, tokens[0], conv_only))
 
-    # ---------- /llm default ----------
+    # ---------- /llmm default ----------
 
-    @llm.command("default")
+    @llmm.command("default")
     async def llm_default(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -406,10 +406,10 @@ class LLMManagerPlugin(Star):
             f"全局默认已设为 [{item['num']}] {item['model']}（{item['instance_id']}）。"
         )
 
-    # ---------- /llm add ----------
+    # ---------- /llmm add ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("add")
+    @llmm.command("add")
     async def llm_add(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -419,8 +419,8 @@ class LLMManagerPlugin(Star):
         tokens = arg.split()
         if len(tokens) < 3:
             yield event.plain_result(
-                "用法：/llm add <站名> <base_url> <key> [类型]\n"
-                "例：/llm add DeepSeek https://api.deepseek.com/v1 sk-xxx\n"
+                "用法：/llmm add <站名> <base_url> <key> [类型]\n"
+                "例：/llmm add DeepSeek https://api.deepseek.com/v1 sk-xxx\n"
                 "类型默认 openai_chat_completion（Anthropic/Gemini 等可显式指定）。"
             )
             return
@@ -437,13 +437,13 @@ class LLMManagerPlugin(Star):
         yield event.plain_result(
             f"已添加后端源：{src['site']}（id={src['id']}）\n"
             f"  Base URL：{src['api_base']}\n"
-            "下一步：/llm group add <站名> <分组名> [模型...] 建立分组。"
+            "下一步：/llmm group add <站名> <分组名> [模型...] 建立分组。"
         )
 
-    # ---------- /llm import ----------
+    # ---------- /llmm import ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("import")
+    @llmm.command("import")
     async def llm_import(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -468,7 +468,7 @@ class LLMManagerPlugin(Star):
             yield event.plain_result(
                 "未找到 cmd_config.json。已尝试路径：\n"
                 + "\n".join(f"  {c}" for c in candidates)
-                + "\n请确认 AstrBot 数据目录结构，或手动用 /llm add 添加。"
+                + "\n请确认 AstrBot 数据目录结构，或手动用 /llmm add 添加。"
             )
             return
 
@@ -496,21 +496,21 @@ class LLMManagerPlugin(Star):
         elif result.get("original_default"):
             lines.append(
                 f"  ⚠️ 原默认模型 {result['original_default']} 未在目录中匹配到，"
-                "请用 /llm default <序号> 手动设置。"
+                "请用 /llmm default <序号> 手动设置。"
             )
         else:
             lines.append(
                 "  ⚠️ 未检测到原默认模型（default_provider_id 为空），"
-                "当前用兜底模型，建议 /llm default <序号> 设置。"
+                "当前用兜底模型，建议 /llmm default <序号> 设置。"
             )
 
-        lines.append("\n用 /llm list 查看，/llm use <序号> 切换。")
+        lines.append("\n用 /llmm list 查看，/llmm use <序号> 切换。")
         yield event.plain_result("\n".join(lines))
 
-    # ---------- /llm resync ----------
+    # ---------- /llmm resync ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("resync")
+    @llmm.command("resync")
     async def llm_resync(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -554,19 +554,19 @@ class LLMManagerPlugin(Star):
             lines.append("  ✅ 全局默认模型已保留")
         else:
             lines.append(
-                "  ⚠️ 原全局默认模型已不存在，已清空（用 /llm default <序号> 重新设置）"
+                "  ⚠️ 原全局默认模型已不存在，已清空（用 /llmm default <序号> 重新设置）"
             )
         if result["overrides_cleaned"]:
             lines.append(f"  已清理 {result['overrides_cleaned']} 个无效会话切换")
         if result["skipped"]:
             lines.append(f"  跳过（非聊天模型）：{', '.join(result['skipped'])}")
-        lines.append("\n用 /llm list 查看最新配置。")
+        lines.append("\n用 /llmm list 查看最新配置。")
         yield event.plain_result("\n".join(lines))
 
-    # ---------- /llm group ----------
+    # ---------- /llmm group ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("group")
+    @llmm.command("group")
     async def llm_group(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -578,7 +578,7 @@ class LLMManagerPlugin(Star):
         if not tokens:
             yield event.plain_result(
                 "子命令：add / rm / enable / disable\n"
-                "例：/llm group add DeepSeek 推理 deepseek-reasoner"
+                "例：/llmm group add DeepSeek 推理 deepseek-reasoner"
             )
             return
 
@@ -586,7 +586,7 @@ class LLMManagerPlugin(Star):
 
         if sub == "add":
             if len(tokens) < 3:
-                yield event.plain_result("用法：/llm group add <站名> <分组名> [模型...]")
+                yield event.plain_result("用法：/llmm group add <站名> <分组名> [模型...]")
                 return
             try:
                 inst = store.add_instance(tokens[1], tokens[2], tokens[3:])
@@ -597,13 +597,13 @@ class LLMManagerPlugin(Star):
             extra = f"，已挂载 {added} 个模型" if added else ""
             yield event.plain_result(
                 f"已创建分组实例：{inst['id']}{extra}\n"
-                "后续可用 /llm model add <实例id> <模型id>... 继续挂载模型。"
+                "后续可用 /llmm model add <实例id> <模型id>... 继续挂载模型。"
             )
             return
 
         if sub == "rm":
             if len(tokens) < 2:
-                yield event.plain_result("用法：/llm group rm <实例id>")
+                yield event.plain_result("用法：/llmm group rm <实例id>")
                 return
             ok = store.remove_instance(tokens[1])
             yield event.plain_result(f"已删除实例 {tokens[1]}。" if ok else f"未找到实例 {tokens[1]}。")
@@ -611,7 +611,7 @@ class LLMManagerPlugin(Star):
 
         if sub in ("enable", "disable"):
             if len(tokens) < 2:
-                yield event.plain_result(f"用法：/llm group {sub} <实例id>")
+                yield event.plain_result(f"用法：/llmm group {sub} <实例id>")
                 return
             ok = store.set_instance_enabled(tokens[1], sub == "enable")
             yield event.plain_result(
@@ -622,10 +622,10 @@ class LLMManagerPlugin(Star):
 
         yield event.plain_result(f"未知子命令 {sub!r}。支持：add / rm / enable / disable")
 
-    # ---------- /llm model ----------
+    # ---------- /llmm model ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("model")
+    @llmm.command("model")
     async def llm_model(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -636,13 +636,13 @@ class LLMManagerPlugin(Star):
         store = get_store()
         if not tokens:
             yield event.plain_result(
-                "子命令：add / rm\n例：/llm model add deepseek_推理 deepseek-reasoner"
+                "子命令：add / rm\n例：/llmm model add deepseek_推理 deepseek-reasoner"
             )
             return
 
         sub = tokens[0].lower()
         if len(tokens) < 3:
-            yield event.plain_result(f"用法：/llm model {sub} <实例id> <模型id>...")
+            yield event.plain_result(f"用法：/llmm model {sub} <实例id> <模型id>...")
             return
 
         inst_id, models = tokens[1], tokens[2:]
@@ -664,10 +664,10 @@ class LLMManagerPlugin(Star):
         except ValueError as e:
             yield event.plain_result(f"操作失败：{e}")
 
-    # ---------- /llm enable / disable ----------
+    # ---------- /llmm enable / disable ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("enable")
+    @llmm.command("enable")
     async def llm_enable(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -678,7 +678,7 @@ class LLMManagerPlugin(Star):
         yield event.plain_result(f"已启用 {arg.strip()}。" if ok else f"未找到实例 {arg.strip()}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("disable")
+    @llmm.command("disable")
     async def llm_disable(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -688,10 +688,10 @@ class LLMManagerPlugin(Star):
         ok = store.set_instance_enabled(arg.strip(), False)
         yield event.plain_result(f"已停用 {arg.strip()}。" if ok else f"未找到实例 {arg.strip()}。")
 
-    # ---------- /llm rm ----------
+    # ---------- /llmm rm ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @llm.command("rm")
+    @llmm.command("rm")
     async def llm_rm(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -702,10 +702,10 @@ class LLMManagerPlugin(Star):
         if not tokens:
             yield event.plain_result(
                 "用法：\n"
-                "  /llm rm source <站名|源id>   删除一级源（含所有分组和模型）\n"
-                "  /llm rm instance <实例id>     删除实例\n"
-                "  /llm rm model <实例id> <模型id>  删除模型\n"
-                "注意：删除后立即生效，用 /llm list 查看。"
+                "  /llmm rm source <站名|源id>   删除一级源（含所有分组和模型）\n"
+                "  /llmm rm instance <实例id>     删除实例\n"
+                "  /llmm rm model <实例id> <模型id>  删除模型\n"
+                "注意：删除后立即生效，用 /llmm list 查看。"
             )
             return
 
@@ -714,22 +714,22 @@ class LLMManagerPlugin(Star):
 
         if sub == "source":
             if len(tokens) < 2:
-                yield event.plain_result("用法：/llm rm source <站名|源id>")
+                yield event.plain_result("用法：/llmm rm source <站名|源id>")
                 return
             target = tokens[1]
             ok = store.remove_source(target)
             if ok:
                 yield event.plain_result(
                     f"已删除一级源 {target}（含其下所有分组和模型）。\n"
-                    "用 /llm list 查看最新配置。"
+                    "用 /llmm list 查看最新配置。"
                 )
             else:
-                yield event.plain_result(f"未找到一级源 {target}（用 /llm list 查看站名/源id）。")
+                yield event.plain_result(f"未找到一级源 {target}（用 /llmm list 查看站名/源id）。")
             return
 
         if sub == "instance":
             if len(tokens) < 2:
-                yield event.plain_result("用法：/llm rm instance <实例id>")
+                yield event.plain_result("用法：/llmm rm instance <实例id>")
                 return
             ok = store.remove_instance(tokens[1])
             yield event.plain_result(f"已删除实例 {tokens[1]}。" if ok else f"未找到实例 {tokens[1]}。")
@@ -737,7 +737,7 @@ class LLMManagerPlugin(Star):
 
         if sub == "model":
             if len(tokens) < 3:
-                yield event.plain_result("用法：/llm rm model <实例id> <模型id>")
+                yield event.plain_result("用法：/llmm rm model <实例id> <模型id>")
                 return
             n = store.remove_models(tokens[1], tokens[2:])
             yield event.plain_result(
@@ -748,9 +748,9 @@ class LLMManagerPlugin(Star):
 
         yield event.plain_result(f"未知子命令 {sub!r}。支持：source / instance / model")
 
-    # ---------- /llm stats ----------
+    # ---------- /llmm stats ----------
 
-    @llm.command("stats")
+    @llmm.command("stats")
     async def llm_stats(self, event: AstrMessageEvent, arg: str = ""):
         """查看各模型 Token 消耗排行。
 
@@ -814,12 +814,12 @@ class LLMManagerPlugin(Star):
         lines.append("━" * 30)
         lines.append(f"合计: {total_tokens:,} Token | {total_calls} 次调用")
         lines.append("")
-        lines.append("提示: /llm stats 1d | 7d | 30d | all  切换时间范围")
+        lines.append("提示: /llmm stats 1d | 7d | 30d | all  切换时间范围")
         lines.append("（仅统计非流式对话，流式对话暂不记录）")
 
         yield event.plain_result("\n".join(lines))
 
-    # ---------- /llm test ----------
+    # ---------- /llmm test ----------
 
     async def _test_one_model(self, store: Store, item: dict) -> tuple:
         """测试单个模型连通性与延迟。
@@ -845,7 +845,7 @@ class LLMManagerPlugin(Star):
         except Exception as e:
             return (item, False, 0.0, str(e))
 
-    @llm.command("test")
+    @llmm.command("test")
     async def llm_test(
         self,
         event: AstrMessageEvent,
@@ -874,7 +874,7 @@ class LLMManagerPlugin(Star):
         for part in raw_parts:
             if part:
                 tokens.extend(str(part).split())
-        logger.info("[LLM Manager] /llm test 参数解析 | raw=%r | tokens=%r", raw_parts, tokens)
+        logger.info("[LLM Manager] /llmm test 参数解析 | raw=%r | tokens=%r", raw_parts, tokens)
 
         # 不带参数：测试当前正在使用的模型
         if not tokens:
@@ -922,7 +922,7 @@ class LLMManagerPlugin(Star):
         if not items:
             yield event.plain_result(
                 f"未找到任何目标：{', '.join(not_found)}\n"
-                "用法：/llm test <序号|模型id|实例id>...（/llm list 查看序号）"
+                "用法：/llmm test <序号|模型id|实例id>...（/llmm list 查看序号）"
             )
             return
 
@@ -953,9 +953,9 @@ class LLMManagerPlugin(Star):
         lines.append(f"—— {success_count}/{len(results)} 成功 ——")
         yield event.plain_result("\n".join(lines))
 
-    # ---------- /llm help ----------
+    # ---------- /llmm help ----------
 
-    @llm.command("help")
+    @llmm.command("help")
     async def llm_help(self, event: AstrMessageEvent, arg: str = ""):
         deny = self._deny_if_not_admin(event)
         if deny is not None:
@@ -966,19 +966,19 @@ class LLMManagerPlugin(Star):
             "LLM 供应商管理插件\n"
             "三级结构：API Base URL → 实例(站名_分组名) → 模型[全局序号]\n\n"
             "查看/切换：\n"
-            "  /llm list [关键词] [-t]      三级卡片图片查看；-t 纯文本\n"
-            "  /llm use <序号|模型id|实例id> [-c]   全局切换；-c 仅当前会话\n"
-            "  /llm use global            清除会话切换，回到全局默认\n"
-            "  /llm default <目标>        设置全局默认模型/实例\n"
+            "  /llmm list [关键词] [-t]      三级卡片图片查看；-t 纯文本\n"
+            "  /llmm use <序号|模型id|实例id> [-c]   全局切换；-c 仅当前会话\n"
+            "  /llmm use global            清除会话切换，回到全局默认\n"
+            "  /llmm default <目标>        设置全局默认模型/实例\n"
             "管理（管理员）：\n"
-            "  /llm import                 从系统配置(cmd_config.json)导入已有供应商\n"
-            "  /llm add <站名> <base_url> <key> [类型]   新增后端源\n"
-            "  /llm group add <站名> <分组名> [模型...]   新增分组实例\n"
-            "  /llm group rm|enable|disable <实例id>\n"
-            "  /llm model add|rm <实例id> <模型id>...    挂载/移除模型\n"
+            "  /llmm import                 从系统配置(cmd_config.json)导入已有供应商\n"
+            "  /llmm add <站名> <base_url> <key> [类型]   新增后端源\n"
+            "  /llmm group add <站名> <分组名> [模型...]   新增分组实例\n"
+            "  /llmm group rm|enable|disable <实例id>\n"
+            "  /llmm model add|rm <实例id> <模型id>...    挂载/移除模型\n"
             "运维：\n"
-            "  /llm stats [1d|7d|30d|all]  各模型 Token 消耗排行\n"
-            "  /llm test <目标>           连通性与时延测试\n"
+            "  /llmm stats [1d|7d|30d|all]  各模型 Token 消耗排行\n"
+            "  /llmm test <目标>           连通性与时延测试\n"
             "配置存放：data/plugin_data/astrbot_plugin_llm_manager/backends.json"
         )
         yield event.plain_result(help_text)

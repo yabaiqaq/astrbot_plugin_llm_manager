@@ -236,7 +236,7 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
         msg = "尚未配置任何后端"
         mw = _text_width(draw, msg, f_instance)
         draw.text(((WIDTH - mw) // 2, y + 30), msg, font=f_instance, fill=TEXT_SECONDARY)
-        hint = "用 /llm import 从系统配置导入，或 /llm add 手动添加"
+        hint = "用 /llmm import 从系统配置导入，或 /llmm add 手动添加"
         hw = _text_width(draw, hint, f_tag)
         draw.text(((WIDTH - hw) // 2, y + 58), hint, font=f_tag, fill=TEXT_MUTED)
         return _save(img)

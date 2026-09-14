@@ -193,7 +193,7 @@ class Store:
         group: str,
         models: list[str] | None = None,
     ) -> dict[str, Any]:
-        """在指定站名下新增分组实例。模型名可选，随后可用 /llm model add 追加。"""
+        """在指定站名下新增分组实例。模型名可选，随后可用 /llmm model add 追加。"""
         site = sanitize_id(site)
         group = str(group).strip()
         if not group:
@@ -201,7 +201,7 @@ class Store:
         source = self.find_source(site)
         if source is None:
             raise ValueError(
-                f"未找到站名 {site} 的一级源，请先执行 /llm add {site} <base_url> <key>"
+                f"未找到站名 {site} 的一级源，请先执行 /llmm add {site} <base_url> <key>"
             )
 
         inst_id = self._make_instance_id(site, group)
@@ -264,7 +264,7 @@ class Store:
     def add_models(self, instance_id: str, models: list[str]) -> int:
         inst = self.find_instance(instance_id)
         if inst is None:
-            raise ValueError(f"未找到实例 {instance_id}，可先 /llm list 查看现有实例")
+            raise ValueError(f"未找到实例 {instance_id}，可先 /llmm list 查看现有实例")
         existing = {m["name"] for m in inst.get("models", [])}
         added = 0
         for m in _normalize_models(models):
@@ -293,7 +293,7 @@ class Store:
         """按 源 -> 实例 -> 模型 顺序生成全局编号目录。
 
         序号按 api_base 排序后分配（同 api_base 下保持 source 原有顺序），
-        与 /llm list 显示顺序一致，避免序号跳号。
+        与 /llmm list 显示顺序一致，避免序号跳号。
 
         每条：{num, model, modalities, instance_id, source_id, site, api_base,
         source_enabled, instance_enabled, disabled}

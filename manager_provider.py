@@ -301,7 +301,7 @@ class LLMManagerProvider(Provider):
         if routed is None:
             raise RuntimeError(
                 "LLM Manager 尚未配置任何可用模型。"
-                "请先执行 /llm add 添加后端、/llm group add 建立分组，再用 /llm list 查看。"
+                "请先执行 /llmm add 添加后端、/llmm group add 建立分组，再用 /llmm list 查看。"
             )
         return routed
 

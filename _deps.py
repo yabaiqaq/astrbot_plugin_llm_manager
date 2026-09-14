@@ -49,7 +49,7 @@ def ensure_pillow(min_version: str = _PILLOW_MIN_VERSION) -> bool:
         logger.info("[LLM Manager] Pillow 安装成功。")
         return True
     except subprocess.TimeoutExpired:
-        logger.warning("[LLM Manager] Pillow 安装超时（>180s），/llm list 将回退纯文本。")
+        logger.warning("[LLM Manager] Pillow 安装超时（>180s），/llmm list 将回退纯文本。")
     except Exception as e:  # noqa: BLE001
-        logger.warning("[LLM Manager] Pillow 自动安装失败：%s，/llm list 将回退纯文本。", e)
+        logger.warning("[LLM Manager] Pillow 自动安装失败：%s，/llmm list 将回退纯文本。", e)
     return False
