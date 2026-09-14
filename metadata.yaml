@@ -2,7 +2,7 @@ name: astrbot_plugin_llm_manager
 display_name: LLM 供应商管理
 short_desc: 把全部模型按 "地址→分组→模型" 三级归拢，通过指令实现图形化查看模型列表、全局切换、单个或多个模型测速、查看 token 消耗，全程指令化不用进后台
 desc: 把全部模型按 "地址→分组→模型" 三级归拢，通过指令实现图形化查看模型列表、全局切换、单个或多个模型测速、查看 token 消耗，全程指令化不用进后台。
-version: v1.0
+version: v2.0
 author: yabaiqaq
 requirements:
   - Pillow>=10.0.0
