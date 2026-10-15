@@ -115,20 +115,37 @@ def _round_rect(draw: ImageDraw.ImageDraw, xy: tuple, radius: int, **kw: Any) ->
 
 # ---------- 高度计算 ----------
 
-def _group_sources_by_api_base(store: Any) -> dict[str, list[dict[str, Any]]]:
-    """把所有 source 按 api_base 分组，返回按 api_base 排序的有序 dict。
-    同 api_base 下保持 source 原有顺序。"""
+def _group_sources_by_api_base(
+    store: Any, catalog: list[dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """按 api_base 分组；指定目录时只保留匹配的源、实例和模型，不修改仓库。"""
+    matches: dict[tuple[str, str], set[str]] = {}
+    if catalog is not None:
+        for item in catalog:
+            matches.setdefault((item["source_id"], item["instance_id"]), set()).add(item["model"])
     groups: dict[str, list[dict[str, Any]]] = {}
     for src in store.sources():
+        if catalog is not None:
+            instances = []
+            for inst in src.get("instances", []):
+                names = matches.get((src["id"], inst["id"]), set())
+                models = [m for m in inst.get("models", []) if m["name"] in names]
+                if models:
+                    instances.append({**inst, "models": models})
+            if not instances:
+                continue
+            src = {**src, "instances": instances}
         api_base = str(src.get("api_base", ""))
         groups.setdefault(api_base, []).append(src)
     # 按 api_base 字母排序，与 build_catalog 序号分配顺序一致
     return dict(sorted(groups.items(), key=lambda x: x[0]))
 
 
-def _calc_height(store: Any) -> int:
+def _calc_height(store: Any, catalog: list[dict[str, Any]] | None = None) -> int:
     h = TITLE_HEIGHT + PADDING + CURRENT_BANNER_H + CARD_GAP
-    api_groups = _group_sources_by_api_base(store)
+    api_groups = _group_sources_by_api_base(store, catalog)
+    if not api_groups:
+        h += 100 + CARD_GAP
     for api_base, sources in api_groups.items():
         h += API_BASE_HEADER_H  # api_base 卡片标题
         for src in sources:
@@ -144,11 +161,17 @@ def _calc_height(store: Any) -> int:
 
 # ---------- 主渲染 ----------
 
-def render_catalog_image(store: Any, umo: str | None = None) -> str:
-    """渲染目录为 PNG 图片，返回临时文件路径。"""
-    catalog = store.build_catalog()
+def render_catalog_image(
+    store: Any, umo: str | None = None,
+    *, catalog: list[dict[str, Any]] | None = None,
+) -> str:
+    """渲染目录为 PNG；可传入筛选目录，保留原有全局序号。"""
+    full_catalog = store.build_catalog()
+    api_groups = _group_sources_by_api_base(store, catalog)
+    height = _calc_height(store, catalog)
+    catalog = full_catalog if catalog is None else catalog
     total_models = len(catalog)
-    total_sources = len(store.sources())
+    total_sources = sum(len(sources) for sources in api_groups.values())
     default_inst = store.data.get("default_instance", "")
     default_model = store.data.get("default_model", "")
     override_id = store.get_conversation_override(umo) if umo else None
@@ -159,12 +182,11 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
     current_model_name = current_routed["model_name"] if current_routed else ""
     # 找到当前模型的全局序号
     current_num = None
-    for item in catalog:
+    for item in full_catalog:
         if item["instance_id"] == current_instance_id and item["model"] == current_model_name:
             current_num = item["num"]
             break
 
-    height = _calc_height(store)
     img = Image.new("RGB", (WIDTH, height), BG)
     draw = ImageDraw.Draw(img)
 
@@ -242,7 +264,6 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
         return _save(img)
 
     # ===== API Base 卡片（按 api_base 分组，同 api_base 下多个 source 合并显示）=====
-    api_groups = _group_sources_by_api_base(store)
     for api_base, sources in api_groups.items():
         # 计算卡片高度
         card_h = API_BASE_HEADER_H
@@ -330,7 +351,7 @@ def render_catalog_image(store: Any, umo: str | None = None) -> str:
                     continue
 
                 for item in catalog:
-                    if item["instance_id"] != inst_id:
+                    if item["source_id"] != src["id"] or item["instance_id"] != inst_id:
                         continue
                     model_name = item["model"]
                     disabled = item["disabled"]

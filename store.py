@@ -322,6 +322,16 @@ class Store:
                     num += 1
         return catalog
 
+    def search_models(self, query: str) -> list[dict[str, Any]]:
+        """按模型名忽略大小写做子串匹配，多个关键词需全部命中，保留全局序号。"""
+        keywords = query.casefold().split()
+        if not keywords:
+            return []
+        return [
+            item for item in self.build_catalog()
+            if all(keyword in item["model"].casefold() for keyword in keywords)
+        ]
+
     def find_in_catalog(self, target: str) -> dict[str, Any] | None:
         """按 序号 / 完整路径(实例ID/模型ID) / 模型 ID / 实例 ID 解析目标（优先级从高到低）。"""
         target = str(target).strip()

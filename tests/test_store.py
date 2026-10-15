@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from store import DEFAULT_MODALITIES, Store
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from astrbot_plugin_llm_manager.store import DEFAULT_MODALITIES, Store
 
 
 class StoreTest(unittest.TestCase):
@@ -121,6 +123,44 @@ class StoreTest(unittest.TestCase):
         # 不存在的路径
         self.assertIsNone(s.find_in_catalog("DeepSeek_通用/nonexistent"))
         self.assertIsNone(s.find_in_catalog("Nonexistent_组/deepseek-chat"))
+
+    def test_search_models_case_insensitive_and_partial(self):
+        s = self.seed()
+        items = s.search_models("  DEEPSEEK  ")
+        self.assertEqual([item["num"] for item in items], [1, 2, 3])
+        self.assertEqual(s.search_models("seek-v")[0]["model"], "deepseek-v3")
+
+    def test_search_models_multiple_keywords_and_slash(self):
+        s = self.seed()
+        items = s.search_models("72B   qWEN")
+        self.assertEqual([item["num"] for item in items], [4])
+        self.assertEqual(s.search_models("Qwen/Qwen2.5")[0]["num"], 4)
+        self.assertEqual(s.search_models("deepseek 72b"), [])
+
+    def test_search_models_preserves_duplicate_names_and_disabled(self):
+        s = self.seed()
+        s.add_models("硅基流动_通用", ["deepseek-v3"])
+        s.set_instance_enabled("DeepSeek_通用", False)
+        items = s.search_models("deepseek-v3")
+        self.assertEqual([item["num"] for item in items], [2, 5])
+        self.assertEqual([item["disabled"] for item in items], [True, False])
+        self.assertEqual(
+            [s.find_in_catalog(str(item["num"])) for item in items], items
+        )
+        s.find_source("硅基流动")["enabled"] = False
+        self.assertTrue(all(item["disabled"] for item in s.search_models("deepseek-v3")))
+
+    def test_search_models_only_matches_model_names(self):
+        s = self.seed()
+        self.assertEqual(s.search_models("硅基流动"), [])
+        self.assertEqual(s.search_models("api.deepseek.com"), [])
+        self.assertEqual(s.search_models("通用"), [])
+
+    def test_search_models_empty_and_no_match(self):
+        self.assertEqual(self.store.search_models("deepseek"), [])
+        s = self.seed()
+        self.assertEqual(s.search_models("  \t  "), [])
+        self.assertEqual(s.search_models("nonexistent-model"), [])
 
     # ---------- 路由 ----------
 
@@ -239,16 +279,16 @@ class StoreTest(unittest.TestCase):
         # 验证三级结构
         cat = s.build_catalog()
         self.assertEqual([i["model"] for i in cat], [
-            "deepseek-v4-flash", "deepseek-v4-pro", "gpt-5.5"
+            "gpt-5.5", "deepseek-v4-flash", "deepseek-v4-pro"
         ])
-        # 实例 id 就是提供商源唯一 ID
-        self.assertEqual(cat[0]["instance_id"], "deepseek")
-        self.assertEqual(cat[2]["instance_id"], "openai_1")
+        # 目录按 api_base 排序，实例 id 就是提供商源唯一 ID
+        self.assertEqual(cat[0]["instance_id"], "openai_1")
+        self.assertEqual(cat[1]["instance_id"], "deepseek")
         # api_base 去尾部斜杠
         src = s.find_source("deepseek")
         self.assertEqual(src["api_base"], "https://api.deepseek.com/v1")
         # modalities 保留
-        self.assertEqual(cat[2]["modalities"], ["text", "tool_use", "image"])
+        self.assertEqual(cat[0]["modalities"], ["text", "tool_use", "image"])
 
     def test_import_idempotent(self):
         s = Store(self.path)

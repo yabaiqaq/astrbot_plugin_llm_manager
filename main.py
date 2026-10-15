@@ -5,6 +5,7 @@
 
 指令集（全部以 /llmm 开头）：
   list    三级查看（默认图片卡片，-t 纯文本）
+  search  按模型名关键词模糊搜索
   use     全局/会话切换（序号/模型ID/实例ID）
   default 查看/设置全局默认
   add     新增一级源（站名 + base_url + key）
@@ -325,6 +326,67 @@ class LLMManagerPlugin(Star):
                 f"图片渲染失败（{e}），已回退纯文本：\n"
                 + _render_tree(store, event.unified_msg_origin)
             )
+            return
+
+        try:
+            yield event.image_result(img_path)
+        finally:
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+
+    # ---------- /llmm search ----------
+
+    @llmm.command("search")
+    async def llm_search(self, event: AstrMessageEvent, arg: str = ""):
+        """/llmm search <模型名关键词>  模糊搜索模型，多个关键词需全部命中。"""
+        deny = self._deny_if_not_admin(event)
+        if deny is not None:
+            yield deny
+            return
+
+        query = arg.strip()
+        if not query:
+            yield event.plain_result(
+                "用法：/llmm search <模型名关键词>\n"
+                "例：/llmm search deepseek\n"
+                "例：/llmm search qwen 72b（多个关键词需全部命中，忽略大小写）"
+            )
+            return
+
+        store = get_store()
+        items = store.search_models(query)
+        if not items:
+            yield event.plain_result(
+                f"未找到模型名匹配 {query!r} 的模型。\n"
+                "可缩短关键词重试，或用 /llmm list 查看已导入的模型。"
+            )
+            return
+
+        routed = store.resolve(umo=event.unified_msg_origin)
+        lines = [f"模型搜索 {query!r}：共 {len(items)} 条匹配"]
+        for item in items:
+            status = "（停用）" if item["disabled"] else ""
+            if (
+                not item["disabled"] and routed
+                and item["instance_id"] == routed["instance"]["id"]
+                and item["model"] == routed["model_name"]
+            ):
+                status += "  ● 使用中"
+            lines.append(
+                f"[{item['num']}] {item['model']}"
+                f"{_modality_mark(item['modalities'])}{status}\n"
+                f"  站点：{item['site']} · 分组：{item['instance_id']}"
+            )
+        lines.append("序号与 /llmm list 一致，可用 /llmm use <序号> 切换。")
+        try:
+            img_path = render_catalog_image(
+                store, event.unified_msg_origin, catalog=items,
+            )
+        except Exception as e:
+            logger.warning("渲染搜索图片失败，回退纯文本：%s", e)
+            yield event.plain_result("图片渲染失败，已回退纯文本。\n" + "\n".join(lines))
             return
 
         try:
@@ -967,6 +1029,7 @@ class LLMManagerPlugin(Star):
             "三级结构：API Base URL → 实例(站名_分组名) → 模型[全局序号]\n\n"
             "查看/切换：\n"
             "  /llmm list [关键词] [-t]      三级卡片图片查看；-t 纯文本\n"
+            "  /llmm search <模型名关键词>   模糊搜索并返回卡片图片；多关键词全部匹配\n"
             "  /llmm use <序号|模型id|实例id> [-c]   全局切换；-c 仅当前会话\n"
             "  /llmm use global            清除会话切换，回到全局默认\n"
             "  /llmm default <目标>        设置全局默认模型/实例\n"
