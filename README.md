@@ -44,7 +44,7 @@
 
 /llmm list            # 查看所有模型 （渲染成卡片图片展示，需安装pillow）
 /llmm search deepseek # 按模型名模糊搜索，返回匹配模型及原有序号
-/llmm search qwen 72b # 多个关键词需全部命中，忽略大小写
+/llmm search gpt 6    # 多个关键词需全部命中，忽略大小写
 /llmm use 3           # 切换到序号 3 的模型 （全局生效）
 
 /llmm test            # 测试当前模型延迟
