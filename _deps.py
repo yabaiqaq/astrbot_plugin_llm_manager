@@ -9,7 +9,7 @@ import importlib
 import subprocess
 import sys
 
-from astrbot import logger
+from astrbot.api import logger
 
 _PILLOW_MIN_VERSION = "10.0.0"
 

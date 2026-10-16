@@ -27,8 +27,7 @@ import os
 import time
 from pathlib import Path
 
-from astrbot import logger
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 

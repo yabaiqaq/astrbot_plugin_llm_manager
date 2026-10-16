@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from astrbot import logger
+from astrbot.api import logger
 from astrbot.core.provider.entities import ProviderMetaData, ProviderType
 from astrbot.core.provider.register import provider_cls_map, provider_registry
 

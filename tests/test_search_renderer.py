@@ -9,7 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from PIL import Image, ImageDraw
+
+import _astrbot_stub  # noqa: E402,F401  无 astrbot 环境时注入 logger 替身
 from astrbot_plugin_llm_manager import renderer
 from astrbot_plugin_llm_manager.store import Store
 

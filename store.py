@@ -5,20 +5,20 @@
     二级：提供商源唯一 ID（自动生成为 站名_分组名）
     三级：具体模型 ID
 
-本模块只依赖标准库，便于独立单元测试（不 import astrbot）。
+本模块除 astrbot.api 的 logger 外只依赖标准库；单元测试在
+tests/_astrbot_stub.py 中为无 astrbot 的环境注入 logger 替身后独立运行。
 """
 from __future__ import annotations
 
 import json
-import logging
 import re
 import threading
 from pathlib import Path
 from typing import Any
 
-from .stats import Stats
+from astrbot.api import logger
 
-logger = logging.getLogger("astrbot_plugin_llm_manager")
+from .stats import Stats
 
 #: 未显式声明能力时，模型默认具备的能力
 DEFAULT_MODALITIES = ["text", "tool_use"]

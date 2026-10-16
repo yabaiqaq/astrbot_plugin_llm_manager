@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from astrbot import logger
+from astrbot.api import logger
 from astrbot.api.provider import Provider
 from astrbot.api.star import StarTools
 from astrbot.core.provider.register import provider_cls_map
