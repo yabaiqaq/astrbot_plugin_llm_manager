@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -65,18 +66,59 @@ class Store:
             "default_instance": "",
             "default_model": "",
             "sources": [],
-            "overrides": {},  # umo -> instance_id（会话级切换）
+            # umo -> {"instance_id": ..., "model": ...}（会话级切换）
+            "overrides": {},
         }
 
+    def _normalize_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        """合并默认字段并丢弃明显损坏的结构，避免缺字段导致 KeyError。"""
+        merged = self._default()
+        merged.update(data)
+        if not isinstance(merged.get("sources"), list):
+            merged["sources"] = []
+        merged["sources"] = [
+            src for src in merged["sources"] if isinstance(src, dict)
+        ]
+        for src in merged["sources"]:
+            if not isinstance(src.get("instances"), list):
+                src["instances"] = []
+            src["instances"] = [
+                inst for inst in src["instances"] if isinstance(inst, dict)
+            ]
+            for inst in src["instances"]:
+                if not isinstance(inst.get("models"), list):
+                    inst["models"] = []
+                inst["models"] = [
+                    m for m in inst["models"]
+                    if isinstance(m, dict) and str(m.get("name", "")).strip()
+                ]
+        if not isinstance(merged.get("overrides"), dict):
+            merged["overrides"] = {}
+        for key in ("default_instance", "default_model"):
+            if not isinstance(merged.get(key), str):
+                merged[key] = ""
+        return merged
+
     def _load(self) -> dict[str, Any]:
-        if self.path.exists():
+        if not self.path.exists():
+            return self._default()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("配置根节点不是对象")
+            return self._normalize_data(data)
+        except Exception as e:  # noqa: BLE001
+            backup = self.path.with_name(
+                f"{self.path.name}.corrupt-{int(time.time())}"
+            )
             try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
-        return self._default()
+                self.path.replace(backup)
+                logger.warning(
+                    "[LLM Manager] 配置读取失败，已备份到 %s：%s", backup, e
+                )
+            except OSError:
+                logger.warning("[LLM Manager] 配置读取失败且无法备份：%s", e)
+            return self._default()
 
     def save(self) -> None:
         """持久化（原子写）。"""
@@ -92,7 +134,7 @@ class Store:
     # ---------- 一级：Source（base_url + key）----------
 
     def sources(self) -> list[dict[str, Any]]:
-        return self.data["sources"]
+        return self.data.setdefault("sources", [])
 
     def find_source(self, source_id: str) -> dict[str, Any] | None:
         for src in self.sources():
@@ -256,7 +298,8 @@ class Store:
             self.data["default_instance"] = ""
             self.data["default_model"] = ""
         for umo, val in list(self.data.get("overrides", {}).items()):
-            if val == instance_id:
+            stored_id = val.get("instance_id") if isinstance(val, dict) else val
+            if stored_id == instance_id:
                 del self.data["overrides"][umo]
 
     # ---------- 三级：Model ----------
@@ -280,10 +323,21 @@ class Store:
         inst = self.find_instance(instance_id)
         if inst is None:
             return 0
+        removed_names = {str(m).strip() for m in models}
         before = len(inst.get("models", []))
-        inst["models"] = [m for m in inst.get("models", []) if m["name"] not in set(models)]
+        inst["models"] = [
+            m for m in inst.get("models", []) if m["name"] not in removed_names
+        ]
         removed = before - len(inst["models"])
         if removed:
+            # 默认模型被删除时清空模型指针，由 resolve 回退到该实例首个可用模型
+            if (
+                self.data.get("default_instance") == instance_id
+                and self.data.get("default_model") in removed_names
+            ):
+                self.data["default_model"] = ""
+                if not inst.get("models"):
+                    self.data["default_instance"] = ""
             self.save()
         return removed
 
@@ -381,11 +435,14 @@ class Store:
         return item
 
     def set_conversation_override(self, umo: str, target: str) -> dict[str, Any] | None:
-        """设置会话级切换。"""
+        """设置会话级切换（同时保存实例与模型，保证精确路由）。"""
         item = self.find_in_catalog(target)
         if item is None:
             return None
-        self.data.setdefault("overrides", {})[umo] = item["instance_id"]
+        self.data.setdefault("overrides", {})[umo] = {
+            "instance_id": item["instance_id"],
+            "model": item["model"],
+        }
         self.save()
         return item
 
@@ -397,8 +454,19 @@ class Store:
             return True
         return False
 
-    def get_conversation_override(self, umo: str) -> str | None:
-        return self.data.setdefault("overrides", {}).get(umo)
+    def get_conversation_override(self, umo: str) -> dict[str, str] | None:
+        """返回规范化的会话切换；兼容旧版本的纯 instance_id 字符串。"""
+        raw = self.data.setdefault("overrides", {}).get(umo)
+        if not raw:
+            return None
+        if isinstance(raw, str):
+            return {"instance_id": raw, "model": ""}
+        if isinstance(raw, dict):
+            return {
+                "instance_id": str(raw.get("instance_id") or ""),
+                "model": str(raw.get("model") or ""),
+            }
+        return None
 
     def resolve(
         self,
@@ -424,10 +492,20 @@ class Store:
                 if item["model"] == req_model and _usable(item):
                     return self._to_routed(item)
 
-        # 2. 会话级 override
+        # 2. 会话级 override（先精确匹配模型，模型被删/停用时回退到实例）
         if umo:
-            override_id = self.get_conversation_override(umo)
-            if override_id:
+            override = self.get_conversation_override(umo)
+            if override:
+                override_id = override["instance_id"]
+                override_model = override["model"]
+                if override_model:
+                    for item in catalog:
+                        if (
+                            item["instance_id"] == override_id
+                            and item["model"] == override_model
+                            and _usable(item)
+                        ):
+                            return self._to_routed(item)
                 for item in catalog:
                     if item["instance_id"] == override_id and _usable(item):
                         return self._to_routed(item)
@@ -565,8 +643,10 @@ class Store:
                 instance["enabled"] = any(p.get("enable", True) for p in linked)
 
         # ---------- 自动保留原默认模型 ----------
-        # 读取 cmd_config.json 里原来的 default_provider_id，解析出源ID/模型名，
+        # 读取 cmd_config.json 里原来的默认提供商，解析出源ID/模型名，
         # 在插件目录中匹配并设为全局默认，避免安装插件后默认模型被兜底逻辑改掉。
+        # AstrBot 4.29 起 provider_settings.default_provider_id 被移除，
+        # 默认提供商迁到 agent_runner.config.model.provider_id。
         original_default = ""
         auto_default_set = False
         try:
@@ -574,7 +654,16 @@ class Store:
             original_default = str(
                 provider_settings.get("default_provider_id", "") or ""
             )
-            # 兜底：default_provider_id 为空时尝试从 provider_pool 取第一个
+            if not original_default:
+                agent_runner = config.get("agent_runner", {}) or {}
+                ar_config = (
+                    agent_runner.get("config", {}) or {}
+                    if isinstance(agent_runner, dict) else {}
+                )
+                ar_model = ar_config.get("model", {}) if isinstance(ar_config, dict) else {}
+                if isinstance(ar_model, dict):
+                    original_default = str(ar_model.get("provider_id", "") or "")
+            # 兜底：仍为空时尝试从 provider_pool 取第一个
             if not original_default:
                 pool = provider_settings.get("provider_pool", []) or []
                 if pool:
@@ -587,6 +676,16 @@ class Store:
                         )
         except Exception:  # noqa: BLE001
             original_default = ""
+
+        if original_default and not self.data.get("default_instance", ""):
+            # 只有实例 ID 时使用该实例的第一个可用模型
+            if "/" not in original_default:
+                for item in self.build_catalog():
+                    if item["instance_id"] == original_default and not item["disabled"]:
+                        self.data["default_instance"] = item["instance_id"]
+                        self.data["default_model"] = item["model"]
+                        auto_default_set = True
+                        break
 
         if (
             original_default
@@ -637,8 +736,16 @@ class Store:
         old_default_instance = self.data.get("default_instance", "")
         old_default_model = self.data.get("default_model", "")
         old_overrides = dict(self.data.get("overrides", {}))
-        old_source_count = len(self.data["sources"])
+        old_source_count = len(self.sources())
         old_model_count = len(self.build_catalog())
+
+        # 重建前先备份，避免手动添加的源/模型被误删后无法恢复
+        backup_path = self.path.with_name(self.path.name + ".bak")
+        try:
+            if self.path.exists():
+                backup_path.write_bytes(self.path.read_bytes())
+        except OSError as e:  # noqa: BLE001
+            logger.warning("[LLM Manager] resync 备份失败：%s", e)
 
         # 2. 清空 sources（保留 default/overrides 字段，后面恢复）
         self.data["sources"] = []
@@ -669,12 +776,23 @@ class Store:
                 self.data["default_instance"] = ""
                 self.data["default_model"] = ""
 
-        # 5. 清理无效 overrides（实例已被删除的）
+        # 5. 清理无效 overrides（实例已被删除的；模型被删则回退到实例首个模型）
         valid_instances = {inst["id"] for inst in self.instances()}
-        cleaned_overrides = {
-            umo: iid for umo, iid in old_overrides.items()
-            if iid in valid_instances
+        valid_models = {
+            (item["instance_id"], item["model"]) for item in self.build_catalog()
         }
+        cleaned_overrides: dict[str, dict[str, str]] = {}
+        for umo, val in old_overrides.items():
+            if isinstance(val, dict):
+                iid = str(val.get("instance_id") or "")
+                model = str(val.get("model") or "")
+            else:
+                iid, model = str(val or ""), ""
+            if iid not in valid_instances:
+                continue
+            if model and (iid, model) not in valid_models:
+                model = ""
+            cleaned_overrides[umo] = {"instance_id": iid, "model": model}
         self.data["overrides"] = cleaned_overrides
         overrides_cleaned = len(old_overrides) - len(cleaned_overrides)
 
@@ -689,4 +807,5 @@ class Store:
             "default_preserved": default_preserved,
             "overrides_cleaned": overrides_cleaned,
             "skipped": result["skipped"],
+            "backup_file": backup_path.name if backup_path.exists() else "",
         }

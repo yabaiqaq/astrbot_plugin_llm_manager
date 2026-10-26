@@ -31,7 +31,6 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-from ._deps import ensure_pillow
 from .manager_provider import (
     LLMManagerProvider,
     PROVIDER_TYPE_NAME,
@@ -42,12 +41,14 @@ from .register_provider import (
     register_or_replace_provider_adapter,
     unregister_provider_adapter,
 )
-
-# 运行时自动检测并安装 Pillow（在导入 renderer 之前执行）
-ensure_pillow()
-
-from .renderer import render_catalog_image  # noqa: E402
 from .store import DEFAULT_MODALITIES, Store
+
+# Pillow 仅影响卡片图片，不应阻断插件加载；缺失时回退纯文本。
+try:
+    from .renderer import render_catalog_image
+except Exception as e:  # noqa: BLE001
+    render_catalog_image = None
+    logger.warning("Pillow/renderer 不可用，卡片图片将回退纯文本：%s", e)
 
 PLUGIN_NAME = "astrbot_plugin_llm_manager"
 PROVIDER_TEMPLATE_KEY = "LLM Manager"
@@ -66,6 +67,9 @@ def _provider_template() -> dict:
         "timeout": 120,
         "proxy": "",
         "custom_headers": {},
+        # 虚拟 Provider 作为路由器对外声明完整能力，
+        # 真实模型不支持时由 _filter_by_modalities 降级。
+        "modalities": ["text", "tool_use", "image", "audio"],
     }
 
 
@@ -112,6 +116,25 @@ def _register_provider() -> None:
 _register_provider()
 
 
+def _command_argv(event: AstrMessageEvent, subcommand: str, fallback: str = "") -> list[str]:
+    """解析 `/llmm <subcommand>` 之后的完整参数列表。
+
+    AstrBot 会把消息按空格逐个映射到位置参数，单个 `arg: str` 只能拿到
+    第一个词。这里优先从原始消息文本解析，保证 add/group/rm 等多参数
+    指令完整可用；直接调用（单元测试或旧版本）时退回位置参数。
+    """
+    tokens = str(getattr(event, "message_str", "") or "").strip().split()
+    sub = subcommand.casefold()
+    if tokens and tokens[0].lstrip("/／#!").casefold() == sub:
+        # 某些调用方会先剥掉 `/llmm`，只留下子命令及参数
+        return tokens[1:]
+    for i in range(len(tokens) - 1):
+        head = tokens[i].lstrip("/／#!").casefold()
+        if head.endswith("llmm") and tokens[i + 1].casefold() == sub:
+            return tokens[i + 2:]
+    return fallback.split()
+
+
 def _modality_mark(modalities: list[str] | None) -> str:
     """模型能力标记（工具/视觉/语音），用于纯文本列表显示。"""
     marks = []
@@ -128,7 +151,8 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
     """纯文本三级树渲染（/llmm list -t 使用）。"""
     lines: list[str] = []
 
-    override_id = store.get_conversation_override(umo) if umo else None
+    override = store.get_conversation_override(umo) if umo else None
+    override_id = override["instance_id"] if override else ""
     default_inst = store.data.get("default_instance", "")
     default_model = store.data.get("default_model", "")
 
@@ -158,7 +182,7 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
                     marks.append("源停用")
                 if inst_id == default_inst and default_model == "":
                     marks.append("← 默认")
-                if inst_id == override_id:
+                if override and inst_id == override_id:
                     marks.append("← 本会话")
                 mark_txt = f"  [{' '.join(marks)}]" if marks else ""
                 lines.append(f"    └─ {inst_id}{mark_txt}")
@@ -222,7 +246,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "2.1.1")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "2.1.2")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -294,7 +318,7 @@ class LLMManagerPlugin(Star):
             return
 
         store = get_store()
-        tokens = arg.split()
+        tokens = _command_argv(event, "list", arg)
         text_only = "-t" in tokens
         kw = " ".join(t for t in tokens if t != "-t").strip()
 
@@ -312,6 +336,11 @@ class LLMManagerPlugin(Star):
             return
 
         # 默认：图片卡片渲染
+        if render_catalog_image is None:
+            yield event.plain_result(
+                "Pillow 不可用，已回退纯文本。\n" + _render_tree(store, event.unified_msg_origin)
+            )
+            return
         try:
             img_path = render_catalog_image(store, event.unified_msg_origin)
         except ImportError:
@@ -345,7 +374,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        query = arg.strip()
+        query = " ".join(_command_argv(event, "search", arg)).strip()
         if not query:
             yield event.plain_result(
                 "用法：/llmm search <模型名关键词>\n"
@@ -379,6 +408,11 @@ class LLMManagerPlugin(Star):
                 f"  站点：{item['site']} · 分组：{item['instance_id']}"
             )
         lines.append("序号与 /llmm list 一致，可用 /llmm use <序号> 切换。")
+        if render_catalog_image is None:
+            yield event.plain_result(
+                "Pillow 不可用，已回退纯文本。\n" + "\n".join(lines)
+            )
+            return
         try:
             img_path = render_catalog_image(
                 store, event.unified_msg_origin, catalog=items,
@@ -405,7 +439,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        tokens = arg.split()
+        tokens = _command_argv(event, "use", arg)
         conv_only = "-c" in tokens
         tokens = [t for t in tokens if t != "-c"]
         store = get_store()
@@ -414,7 +448,12 @@ class LLMManagerPlugin(Star):
             # 不带参数：显示当前状态
             umo = event.unified_msg_origin
             routed = store.resolve(umo=umo)
-            override_id = store.get_conversation_override(umo)
+            override = store.get_conversation_override(umo)
+            override_text = "（无）"
+            if override:
+                override_text = override["instance_id"]
+                if override["model"]:
+                    override_text += f"/{override['model']}"
             default_inst = store.data.get("default_instance", "")
             default_model = store.data.get("default_model", "")
             if routed:
@@ -423,12 +462,12 @@ class LLMManagerPlugin(Star):
                     f"  会话 umo：{umo}",
                     f"  全局默认：{default_inst or '（未设置）'}"
                     + (f" / {default_model}" if default_model else " / 实例首个模型"),
-                    f"  会话切换：{override_id or '（无）'}",
+                    f"  会话切换：{override_text}",
                     "",
                     "用法：/llmm use <序号|模型id|实例id> [-c]",
                     "  不带 -c：全局切换；带 -c：仅当前会话；use global 恢复全局默认。",
                 ]
-                if not default_inst and not override_id:
+                if not default_inst and not override:
                     lines.append("")
                     lines.append(
                         "⚠️ 未设置全局默认，当前用的是兜底（第一个启用模型）。"
@@ -450,7 +489,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        target = arg.strip()
+        target = " ".join(_command_argv(event, "default", arg)).strip()
         store = get_store()
         if not target:
             yield event.plain_result(
@@ -477,7 +516,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        tokens = arg.split()
+        tokens = _command_argv(event, "add", arg)
         if len(tokens) < 3:
             yield event.plain_result(
                 "用法：/llmm add <站名> <base_url> <key> [类型]\n"
@@ -561,7 +600,7 @@ class LLMManagerPlugin(Star):
             )
         else:
             lines.append(
-                "  ⚠️ 未检测到原默认模型（default_provider_id 为空），"
+                "  ⚠️ 未检测到原默认模型（default_provider_id / agent_runner 均为空），"
                 "当前用兜底模型，建议 /llmm default <序号> 设置。"
             )
 
@@ -621,6 +660,8 @@ class LLMManagerPlugin(Star):
             lines.append(f"  已清理 {result['overrides_cleaned']} 个无效会话切换")
         if result["skipped"]:
             lines.append(f"  跳过（非聊天模型）：{', '.join(result['skipped'])}")
+        if result.get("backup_file"):
+            lines.append(f"  原配置已备份为：{result['backup_file']}")
         lines.append("\n用 /llmm list 查看最新配置。")
         yield event.plain_result("\n".join(lines))
 
@@ -634,7 +675,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        tokens = arg.split()
+        tokens = _command_argv(event, "group", arg)
         store = get_store()
         if not tokens:
             yield event.plain_result(
@@ -693,7 +734,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        tokens = arg.split()
+        tokens = _command_argv(event, "model", arg)
         store = get_store()
         if not tokens:
             yield event.plain_result(
@@ -734,9 +775,13 @@ class LLMManagerPlugin(Star):
         if deny is not None:
             yield deny
             return
+        target = " ".join(_command_argv(event, "enable", arg)).strip()
+        if not target:
+            yield event.plain_result("用法：/llmm enable <实例id>")
+            return
         store = get_store()
-        ok = store.set_instance_enabled(arg.strip(), True)
-        yield event.plain_result(f"已启用 {arg.strip()}。" if ok else f"未找到实例 {arg.strip()}。")
+        ok = store.set_instance_enabled(target, True)
+        yield event.plain_result(f"已启用 {target}。" if ok else f"未找到实例 {target}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @llmm.command("disable")
@@ -745,9 +790,13 @@ class LLMManagerPlugin(Star):
         if deny is not None:
             yield deny
             return
+        target = " ".join(_command_argv(event, "disable", arg)).strip()
+        if not target:
+            yield event.plain_result("用法：/llmm disable <实例id>")
+            return
         store = get_store()
-        ok = store.set_instance_enabled(arg.strip(), False)
-        yield event.plain_result(f"已停用 {arg.strip()}。" if ok else f"未找到实例 {arg.strip()}。")
+        ok = store.set_instance_enabled(target, False)
+        yield event.plain_result(f"已停用 {target}。" if ok else f"未找到实例 {target}。")
 
     # ---------- /llmm rm ----------
 
@@ -759,7 +808,7 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        tokens = arg.split()
+        tokens = _command_argv(event, "rm", arg)
         if not tokens:
             yield event.plain_result(
                 "用法：\n"
@@ -830,7 +879,8 @@ class LLMManagerPlugin(Star):
         store = get_store()
 
         # 解析时间范围参数
-        arg_lower = arg.strip().lower()
+        range_tokens = _command_argv(event, "stats", arg)
+        arg_lower = (range_tokens[0] if range_tokens else "").lower()
         days_map = {
             "1d": 1, "1": 1, "day": 1, "today": 1,
             "7d": 7, "7": 7, "week": 7,
@@ -846,7 +896,7 @@ class LLMManagerPlugin(Star):
             yield event.plain_result(
                 f"📊 {range_text} 暂无 Token 消耗记录。\n"
                 "（统计功能刚启用，需要一些对话后才会有数据；"
-                "目前仅统计非流式对话，流式对话暂不记录）"
+                "流式对话在提供商返回 usage 时才会记录）"
             )
             return
 
@@ -876,7 +926,7 @@ class LLMManagerPlugin(Star):
         lines.append(f"合计: {total_tokens:,} Token | {total_calls} 次调用")
         lines.append("")
         lines.append("提示: /llmm stats 1d | 7d | 30d | all  切换时间范围")
-        lines.append("（仅统计非流式对话，流式对话暂不记录）")
+        lines.append("（流式对话需提供商返回 usage 才会记录）")
 
         yield event.plain_result("\n".join(lines))
 
@@ -930,12 +980,17 @@ class LLMManagerPlugin(Star):
         # 兼容 AstrBot 两种参数传递方式：
         # 方式一：arg 包含全部文本（"30 31 36"），其余 _p* 为空
         # 方式二：arg 只含第一个（"30"），其余拆分到 _p1="31", _p2="36"
-        raw_parts = [arg, _p1, _p2, _p3, _p4, _p5, _p6, _p7, _p8, _p9]
-        tokens = []
-        for part in raw_parts:
-            if part:
-                tokens.extend(str(part).split())
-        logger.info("[LLM Manager] /llmm test 参数解析 | raw=%r | tokens=%r", raw_parts, tokens)
+        fallback = " ".join(
+            part for part in (arg, _p1, _p2, _p3, _p4, _p5, _p6, _p7, _p8, _p9) if part
+        )
+        tokens = _command_argv(event, "test", fallback)
+        logger.debug("[LLM Manager] /llmm test 参数解析 | tokens=%r", tokens)
+
+        if len(tokens) > 10:
+            yield event.plain_result(
+                f"一次最多测试 10 个模型（当前 {len(tokens)} 个），请分批执行。"
+            )
+            return
 
         # 不带参数：测试当前正在使用的模型
         if not tokens:

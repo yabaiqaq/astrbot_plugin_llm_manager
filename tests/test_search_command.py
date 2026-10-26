@@ -22,10 +22,11 @@ def load_search_command(store, render):
     source = Path(__file__).resolve().parents[1] / "main.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_modality_mark")
+    argv = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_command_argv")
     plugin = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LLMManagerPlugin")
     command = next(node for node in plugin.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "llm_search")
     command.decorator_list = []
-    module = ast.Module(body=[helper, command], type_ignores=[])
+    module = ast.Module(body=[helper, argv, command], type_ignores=[])
     namespace = {
         "AstrMessageEvent": object,
         "DEFAULT_MODALITIES": DEFAULT_MODALITIES,

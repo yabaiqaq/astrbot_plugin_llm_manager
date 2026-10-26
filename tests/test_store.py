@@ -178,6 +178,29 @@ class StoreTest(unittest.TestCase):
         r = s.resolve(umo="umo-A")
         self.assertEqual(r["instance"]["id"], "硅基流动_通用")
 
+    def test_conversation_override_keeps_selected_model(self):
+        s = self.seed()
+        # deepseek-v3 是 DeepSeek_通用 的第二个模型，不能被首个模型覆盖
+        s.set_conversation_override("umo-A", "deepseek-v3")
+        r = s.resolve(umo="umo-A")
+        self.assertEqual(r["instance"]["id"], "DeepSeek_通用")
+        self.assertEqual(r["model_name"], "deepseek-v3")
+
+    def test_conversation_override_legacy_string(self):
+        s = self.seed()
+        s.data["overrides"]["umo-legacy"] = "DeepSeek_推理"
+        r = s.resolve(umo="umo-legacy")
+        self.assertEqual(r["instance"]["id"], "DeepSeek_推理")
+        self.assertEqual(r["model_name"], "deepseek-reasoner")
+
+    def test_remove_default_model_clears_pointer(self):
+        s = self.seed()
+        s.set_default("deepseek-v3")
+        self.assertEqual(s.remove_models("DeepSeek_通用", ["deepseek-v3"]), 1)
+        self.assertEqual(s.data["default_model"], "")
+        # 仍能回退到同实例第一个可用模型
+        self.assertEqual(s.resolve()["instance"]["id"], "DeepSeek_通用")
+
     def test_resolve_default_then_fallback(self):
         s = self.seed()
         r = s.resolve()
@@ -202,6 +225,46 @@ class StoreTest(unittest.TestCase):
         s2 = Store(self.path)  # 重新读取
         self.assertEqual(s2.data["default_instance"], "DeepSeek_推理")
         self.assertEqual(len(s2.sources()), 2)
+
+    def test_load_partial_config_merges_defaults(self):
+        self.path.write_text('{"version": 1}', encoding="utf-8")
+        s = Store(self.path)
+        self.assertEqual(s.sources(), [])
+        self.assertEqual(s.build_catalog(), [])
+        self.assertIsNone(s.resolve())
+        s.add_source("A", "https://a.example/v1", "k")  # 不应因缺字段崩溃
+
+    def test_load_corrupt_config_backs_up(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        s = Store(self.path)
+        self.assertEqual(s.sources(), [])
+        backups = list(self.path.parent.glob("backends.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), "{not json")
+
+    def test_import_reads_agent_runner_default(self):
+        s = Store(self.path)
+        config = {
+            "provider_sources": [
+                {
+                    "id": "deepseek", "provider": "deepseek",
+                    "type": "openai_chat_completion", "provider_type": "chat_completion",
+                    "key": ["sk-a"], "api_base": "https://api.deepseek.com/v1",
+                    "timeout": 120, "proxy": "", "custom_headers": {}, "enable": True,
+                },
+            ],
+            "provider": [
+                {"id": "deepseek/m1", "enable": True, "provider_source_id": "deepseek",
+                 "model": "m1", "modalities": ["text"]},
+            ],
+            "agent_runner": {
+                "config": {"model": {"provider_id": "deepseek/m1"}},
+            },
+        }
+        result = s.import_from_astrbot_config(config)
+        self.assertTrue(result["auto_default_set"])
+        self.assertEqual(s.data["default_model"], "m1")
+        self.assertEqual(s.data["default_instance"], "deepseek")
 
     def test_modalities_default(self):
         s = self.seed()

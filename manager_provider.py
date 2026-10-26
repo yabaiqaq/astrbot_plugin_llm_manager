@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -153,7 +154,7 @@ class LLMManagerProvider(Provider):
 
     def __init__(self, provider_config: dict[str, Any], provider_settings: Any) -> None:
         Provider.__init__(self, provider_config, provider_settings)
-        self._backend_cache: dict[str, Any] = {}
+        self._backend_cache: dict[tuple[str, str], Any] = {}
         # model 字段是占位符（用户在 WebUI 填什么都行，实际模型由 Store 路由决定）
         self.set_model(str(provider_config.get("model") or PROVIDER_TYPE_NAME))
 
@@ -177,8 +178,15 @@ class LLMManagerProvider(Provider):
     # ---------- 后端实例化与缓存 ----------
 
     def _backend_for(self, source: dict[str, Any]) -> Any:
-        """根据 Source 配置实例化 AstrBot 内置 Provider，按 source id 缓存。"""
-        key = source.get("id", "")
+        """根据 Source 配置实例化 AstrBot 内置 Provider。
+
+        缓存键包含完整后端配置指纹：用户修改 Key、api_base、超时、代理
+        或自定义头后会自动重建，不会继续使用旧连接。
+        """
+        cfg = get_store().source_config(source)
+        fingerprint = json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
+        source_id = str(cfg.get("id", ""))
+        key = (source_id, fingerprint)
         cached = self._backend_cache.get(key)
         if cached is not None:
             return cached
@@ -190,7 +198,6 @@ class LLMManagerProvider(Provider):
                 f"未知的提供商类型 {type_name!r}（站名：{source.get('site', '')}）。"
             )
 
-        cfg = get_store().source_config(source)
         cls = meta.cls_type
         try:
             backend = cls(cfg, self.provider_settings)
@@ -198,8 +205,31 @@ class LLMManagerProvider(Provider):
             # 某些 Provider 构造函数只接受一个参数
             backend = cls(cfg)
 
+        # 清掉同一源的旧指纹，避免 Key 轮换后缓存无限增长
+        for cached_key in list(self._backend_cache):
+            if (
+                isinstance(cached_key, tuple)
+                and cached_key[0] == source_id
+                and cached_key != key
+            ):
+                self._backend_cache.pop(cached_key, None)
         self._backend_cache[key] = backend
         return backend
+
+    def _record_usage(self, routed: dict[str, Any], usage: dict[str, int] | None) -> None:
+        """记录一次 token 消耗；任何异常都不能影响主对话流程。"""
+        if not usage:
+            return
+        try:
+            get_store().stats.record(
+                model=routed["model_name"],
+                instance_id=routed["instance"]["id"],
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+                total_tokens=usage["total_tokens"],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[LLM Manager] 记录 token 消耗失败: %s", e)
 
     # ---------- 能力降级 ----------
 
@@ -250,8 +280,8 @@ class LLMManagerProvider(Provider):
             except Exception:
                 pass
 
-        # 诊断日志：确认模型已应用
-        logger.info(
+        # 诊断日志：确认模型已应用（debug，避免每次对话刷 INFO）
+        logger.debug(
             "[LLM Manager] 后端模型已设置 | type=%s model_attr=%r config_model=%r",
             type(backend).__name__,
             getattr(backend, "model", "?"),
@@ -288,12 +318,15 @@ class LLMManagerProvider(Provider):
         # 诊断日志
         default_inst = store.data.get("default_instance", "")
         default_model = store.data.get("default_model", "")
-        override_id = store.get_conversation_override(umo) if umo else None
-        logger.info(
+        override = store.get_conversation_override(umo) if umo else None
+        override_text = (
+            f"{override['instance_id']}/{override['model']}" if override else "(无)"
+        )
+        logger.debug(
             "[LLM Manager] 路由诊断 | incoming_model=%r placeholder=%r ignored=%s "
             "umo=%r | store default=%s/%s override=%s | routed: instance=%s model=%s",
             incoming_model, configured_model, model_ignored, umo,
-            default_inst, default_model, override_id or "(无)",
+            default_inst, default_model, override_text,
             routed["instance"]["id"] if routed else "None",
             routed["model_name"] if routed else "None",
         )
@@ -350,16 +383,9 @@ class LLMManagerProvider(Provider):
         # 记录 token 消耗（不影响主流程，失败仅记日志）
         try:
             usage = _extract_usage(response)
-            if usage:
-                get_store().stats.record(
-                    model=routed["model_name"],
-                    instance_id=routed["instance"]["id"],
-                    prompt_tokens=usage["prompt_tokens"],
-                    completion_tokens=usage["completion_tokens"],
-                    total_tokens=usage["total_tokens"],
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[LLM Manager] 记录 token 消耗失败: %s", e)
+        except Exception:  # noqa: BLE001
+            usage = None
+        self._record_usage(routed, usage)
 
         return response
 
@@ -388,18 +414,31 @@ class LLMManagerProvider(Provider):
             routed["model_entry"], image_urls, audio_urls, func_tool
         )
 
-        async for chunk in backend.text_chat_stream(
-            prompt=prompt,
-            session_id=session_id,
-            image_urls=image_urls,
-            audio_urls=audio_urls,
-            func_tool=func_tool,
-            contexts=contexts,
-            system_prompt=system_prompt,
-            tool_calls_result=tool_calls_result,
-            model=routed["model_name"],
-            tool_choice=tool_choice,
-            request_max_retries=request_max_retries,
-            **kwargs,
-        ):
-            yield chunk
+        usage: dict[str, int] | None = None
+        try:
+            async for chunk in backend.text_chat_stream(
+                prompt=prompt,
+                session_id=session_id,
+                image_urls=image_urls,
+                audio_urls=audio_urls,
+                func_tool=func_tool,
+                contexts=contexts,
+                system_prompt=system_prompt,
+                tool_calls_result=tool_calls_result,
+                model=routed["model_name"],
+                tool_choice=tool_choice,
+                request_max_retries=request_max_retries,
+                **kwargs,
+            ):
+                # 流式响应可能在最后一个 chunk 才携带 usage；
+                # 字符串 chunk 不会有 usage，跳过解析以减少开销。
+                if not isinstance(chunk, str):
+                    try:
+                        candidate = _extract_usage(chunk)
+                    except Exception:  # noqa: BLE001
+                        candidate = None
+                    if candidate:
+                        usage = candidate
+                yield chunk
+        finally:
+            self._record_usage(routed, usage)

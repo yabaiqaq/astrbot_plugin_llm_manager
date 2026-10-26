@@ -26,7 +26,7 @@
 
 1. 安装本插件。
 2. 启动后插件会自动注册一个新提供商类型 **LLM Manager**。
-3. 在 QQ 里发 **`/llmm import`**，从系统配置一键导入已有供应商和模型。导入时会自动读取你原来的 `default_provider_id` 并设为插件全局默认，确保安装后默认模型不变。
+3. 在 QQ 里发 **`/llmm import`**，从系统配置一键导入已有供应商和模型。导入时会自动读取原默认提供商（旧版 `default_provider_id`，AstrBot 4.29+ 的 `agent_runner.config.model.provider_id`）并设为插件全局默认，确保安装后默认模型不变。
 4. 打开 WebUI → **服务提供商**：
    - 新增提供商：类型选 **LLM Manager**，`id` 随意（如 `llm_manager`），`key` 留空，保存。
    - 在该提供商的「模型」区域点「自定义模型」，添加一个占位模型，模型名填 **`main`**（**不要填真实模型名**），保存。
@@ -69,7 +69,7 @@
 
 ## 指令详解
 
-> 所有 `/llmm` 指令默认仅管理员可用。如需放开，在 WebUI 插件配置中关闭 `admin_only`。
+> 所有 `/llmm` 指令默认仅管理员可用。关闭 `admin_only` 后，查看、搜索、切换、测速、统计和帮助对群成员开放；添加、删除、导入、重建等写操作始终仅管理员可用。
 
 ---
 
@@ -163,7 +163,7 @@
 /llmm default                # 查看当前全局默认
 ```
 
-> `/llmm use` 和 `/llmm default` 的区别：`/llmm use` 是临时切换（重启后可能丢失），`/llmm default` 是持久化的全局默认。日常切换用 `/llmm use` 即可。
+> `/llmm use` 不带 `-c` 时会写入全局默认并持久化，`/llmm default` 效果相同、语义更明确。只想影响当前会话时务必加 `-c`。
 
 ---
 
@@ -186,7 +186,7 @@
 - **自动读取你原来的默认模型并设为插件全局默认**，确保安装插件后默认模型不变
 - dashscope 等 agent_runner 类型会自动跳过
 
-> ⚠️ 必须在你把 WebUI 的 default_provider_id 改成 LLM Manager **之前**执行，否则原来的默认模型值已被覆盖，无法自动保留。
+> ⚠️ 必须在你把默认聊天提供商改成 LLM Manager **之前**执行（旧版为 `default_provider_id`，AstrBot 4.29+ 在 agent runner 的模型配置中），否则原来的默认模型值已被覆盖，无法自动保留。
 
 ---
 
@@ -419,23 +419,24 @@
 ## 常见问题
 
 **Q: 切换模型后聊天还是用原来的模型？**
-A: 检查 WebUI 中 LLM Manager 实例的 `model` 字段是否为占位符（如 `main`），不能填真实模型名。同时确认 `default_provider_id` 已设为 LLM Manager 实例。
+A: 检查 WebUI 中 LLM Manager 实例的 `model` 字段是否为占位符（如 `main`），不能填真实模型名。同时确认默认聊天提供商已设为 LLM Manager 实例（旧版为 `default_provider_id`，AstrBot 4.29+ 在 agent runner 的模型配置中）。
 
 **Q: 手动在 WebUI 删除了供应商，`/llmm list` 还显示？**
 A: 插件配置和 AstrBot 配置是独立的。执行 `/llmm resync` 从系统配置完全重建即可。
 
 **Q: 想让群成员也能用切换指令？**
-A: 在 WebUI 插件配置中关闭 `admin_only`，所有 `/llmm` 指令就对所有人开放了。
+A: 在 WebUI 插件配置中关闭 `admin_only`，查看、切换、测速、统计等日常指令会对所有人开放；写操作（添加/删除/导入/重建）仍仅管理员可用。
 
 **Q: 安装插件后默认模型变了？**
-A: 确保先执行 `/llmm import`（此时原默认模型还在），再改 WebUI 的 default_provider_id。导入时会自动保留原默认模型。
+A: 确保先执行 `/llmm import`（此时原默认模型还在），再把默认聊天提供商改成 LLM Manager。导入时会自动保留原默认模型。
 
 ---
 
 ## 数据与配置
 
 - **配置仓库**：`data/plugin_data/astrbot_plugin_llm_manager/backends.json`（三级结构 + 默认与会话切换）
-- **插件配置**：WebUI 插件配置中 `admin_only`（默认开启）控制所有 `/llmm` 指令是否仅管理员可用
+- **插件配置**：WebUI 插件配置中 `admin_only`（默认开启）控制日常指令是否仅管理员可用；写操作始终仅管理员可用
+- **自动备份**：`/llmm resync` 前会生成 `backends.json.bak`；配置损坏时会重命名为 `backends.json.corrupt-<时间戳>` 保留现场
 - 所有 API Key 只存在插件自己的 backends.json 中，不写入 AstrBot 配置
 
 ---
@@ -444,4 +445,4 @@ A: 确保先执行 `/llmm import`（此时原默认模型还在），再改 WebU
 
 - 面向 AstrBot 4.23+（在 4.26.x 上开发验证）
 - 委托层复用 AstrBot 内置 Provider（OpenAI 兼容 / Anthropic / Gemini / 小米等），新增类型无需改本插件
-- 运行时自动检测并安装 Pillow（用于 `/llmm list` 图片渲染）
+- Pillow 用于 `/llmm list` / `/llmm search` 图片渲染；缺失时自动回退纯文本，不影响其他指令。启动时不再自动修改 Python 环境。

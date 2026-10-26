@@ -1,8 +1,8 @@
 {
   "admin_only": {
-    "description": "所有 /llm 指令是否仅管理员可用。默认开启，非管理员调用会被拒绝。",
+    "description": "查看、搜索、切换、测速、统计等日常指令是否仅管理员可用。默认开启。",
     "type": "bool",
     "default": true,
-    "hint": "关闭后群内所有成员都可使用 /llm 指令（包括切换模型），请谨慎操作。"
+    "hint": "关闭后群内所有成员都可用 /llmm list/search/use/default/stats/test/help（包括全局切换模型）。添加、删除、导入、重建等写操作始终仅管理员可用，请谨慎操作。"
   }
 }
