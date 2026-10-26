@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -149,6 +151,160 @@ def _extract_usage(response: Any) -> dict[str, int] | None:
     return None
 
 
+# ---------- 故障转移：错误分类 ----------
+
+_STATUS_IN_MESSAGE = re.compile(r"(?<![\d.])([45]\d{2})(?![\d.])")
+
+_CONTEXT_PATTERNS = (
+    "context length", "context window", "maximum context", "too many tokens",
+    "reduce the length", "上下文长度", "上下文过长",
+)
+_CONTENT_POLICY_PATTERNS = (
+    "content policy", "content_policy", "content filter", "content_filter",
+    "safety", "内容政策", "违规内容", "安全策略",
+)
+_MODEL_MISSING_PATTERNS = (
+    "model not found", "model_not_found", "unknown model", "invalid model",
+    "no such model", "does not exist", "模型不存在", "模型未找到",
+)
+_AUTH_QUOTA_PATTERNS = (
+    "invalid api key", "incorrect api key", "authentication", "unauthorized",
+    "permission denied", "insufficient quota", "quota exceeded",
+    "insufficient_quota", "insufficient balance", "billing",
+    "欠费", "余额不足", "鉴权失败", "密钥无效",
+)
+_BAD_REQUEST_PATTERNS = (
+    "invalid request", "invalid parameter", "bad request", "unprocessable",
+    "参数错误", "请求参数",
+)
+_SOURCE_RETRY_PATTERNS = (
+    "timeout", "timed out", "time out", "connection", "connect error",
+    "network", "dns", "ssl", "econnreset", "econnrefused", "enotfound",
+    "rate limit", "too many requests", "temporarily unavailable",
+    "连接失败", "连接超时", "网络错误",
+)
+_MODEL_RETRY_PATTERNS = (
+    "overloaded", "service unavailable", "internal server error",
+    "bad gateway", "gateway timeout", "server error", "服务不可用",
+)
+
+
+def _exception_status(exc: BaseException) -> int | None:
+    """尽量从异常对象里提取 HTTP 状态码。"""
+    for obj in (exc, getattr(exc, "response", None)):
+        if obj is None:
+            continue
+        if isinstance(obj, dict):
+            values = [
+                obj.get("status_code"), obj.get("status"), obj.get("http_status"),
+            ]
+        else:
+            values = [
+                getattr(obj, "status_code", None),
+                getattr(obj, "status", None),
+                getattr(obj, "http_status", None),
+            ]
+        for value in values:
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                code = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= code <= 599:
+                return code
+    return None
+
+
+def _classify_error(exc: BaseException) -> tuple[bool, str, str]:
+    """判断异常是否值得换模型重试。
+
+    Returns:
+        (retryable, cooldown_scope, reason)
+        cooldown_scope: "source" / "model" / ""
+    """
+    name = type(exc).__name__.casefold()
+    text = str(exc).casefold()
+    code = _exception_status(exc)
+
+    # 用户取消、生成器关闭等不应重试
+    if "cancel" in name or "generator exit" in name:
+        return False, "", "cancelled"
+
+    # 请求本身有问题，换模型也救不回来
+    if any(p in text for p in _CONTEXT_PATTERNS):
+        return False, "", "context_length"
+    if any(p in text for p in _CONTENT_POLICY_PATTERNS):
+        return False, "", "content_policy"
+
+    # 模型下线/名字错误：换备选有意义
+    if any(p in text for p in _MODEL_MISSING_PATTERNS):
+        return True, "model", "model_not_found"
+
+    # 鉴权/欠费：同 key 的其他模型没意义，但换 source 可能有用
+    if any(p in text for p in _AUTH_QUOTA_PATTERNS):
+        return True, "source", "auth_or_quota"
+
+    if code is not None:
+        if code in (400, 413, 422):
+            return False, "", "bad_request"
+        if code in (401, 403, 402, 408, 409, 425, 429):
+            return True, "source", f"source_{code}"
+        if code == 404:
+            return True, "model", "model_not_found"
+        if 500 <= code <= 599:
+            return True, "model", f"server_{code}"
+
+    if any(k in name for k in (
+        "timeout", "connect", "network", "transport", "protocol", "dns", "ssl",
+    )):
+        return True, "source", "timeout_or_connection"
+    if any(k in name for k in ("ratelimit", "quota")):
+        return True, "source", "rate_limit"
+    if "notfound" in name:
+        return True, "model", "model_not_found"
+    if any(k in name for k in ("authentication", "permission", "unauthorized")):
+        return True, "source", "auth"
+    if any(k in name for k in ("badrequest", "invalidrequest", "unprocessable")):
+        return False, "", "bad_request"
+
+    if any(p in text for p in _BAD_REQUEST_PATTERNS):
+        return False, "", "bad_request"
+    if any(p in text for p in _SOURCE_RETRY_PATTERNS):
+        return True, "source", "timeout_or_connection"
+    if any(p in text for p in _MODEL_RETRY_PATTERNS):
+        return True, "model", "server_error"
+
+    match = _STATUS_IN_MESSAGE.search(text)
+    if match:
+        status = int(match.group(1))
+        if status in (400, 413, 422):
+            return False, "", "bad_request"
+        if status in (401, 403, 402, 408, 409, 425, 429):
+            return True, "source", f"source_{status}"
+        if status == 404:
+            return True, "model", "model_not_found"
+        if 500 <= status <= 599:
+            return True, "model", f"server_{status}"
+
+    return False, "", "unknown"
+
+
+def _error_label(exc: BaseException) -> str:
+    """日志用的错误标签，只包含异常类型和状态码，不泄露密钥。"""
+    status = _exception_status(exc)
+    label = type(exc).__name__
+    return f"{label} status={status}" if status else label
+
+
+def _route_key(routed: dict[str, Any]) -> tuple[str, str]:
+    return routed["instance"]["id"], routed["model_name"]
+
+
+def _describe_route(routed: dict[str, Any]) -> str:
+    return f"{routed['instance']['id']}/{routed['model_name']}"
+
+
 class LLMManagerProvider(Provider):
     """虚拟 Provider：注册为 `llm_manager` 类型，路由到真实后端。"""
 
@@ -216,10 +372,18 @@ class LLMManagerProvider(Provider):
         self._backend_cache[key] = backend
         return backend
 
-    def _record_usage(self, routed: dict[str, Any], usage: dict[str, int] | None) -> None:
-        """记录一次 token 消耗；任何异常都不能影响主对话流程。"""
+    def _record_usage(
+        self,
+        routed: dict[str, Any],
+        usage: dict[str, int] | None,
+        primary: dict[str, Any] | None = None,
+    ) -> None:
+        """记录一次成功调用的 token 消耗；失败尝试不记录，避免重复计数。"""
         if not usage:
             return
+        fallback_from = ""
+        if primary is not None and _route_key(primary) != _route_key(routed):
+            fallback_from = _describe_route(primary)
         try:
             get_store().stats.record(
                 model=routed["model_name"],
@@ -227,6 +391,7 @@ class LLMManagerProvider(Provider):
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
                 total_tokens=usage["total_tokens"],
+                fallback_from=fallback_from,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("[LLM Manager] 记录 token 消耗失败: %s", e)
@@ -338,6 +503,142 @@ class LLMManagerProvider(Provider):
             )
         return routed
 
+    # ---------- 故障转移 ----------
+
+    def _build_candidates(
+        self,
+        primary: dict[str, Any],
+        image_urls: list[str] | None,
+        audio_urls: list[str] | None,
+        func_tool: Any,
+    ) -> list[dict[str, Any]]:
+        """主模型 + 备选池，按顺序去重；备选需满足本次请求的能力要求。"""
+        store = get_store()
+        fb = store.fallback_config()
+        if not fb.get("enabled"):
+            return [primary]
+
+        required: set[str] = set()
+        if image_urls:
+            required.add("image")
+        if audio_urls:
+            required.add("audio")
+        if func_tool is not None:
+            required.add("tool_use")
+
+        candidates = [primary]
+        seen = {_route_key(primary)}
+        for routed in store.resolve_fallback_entries(required):
+            key = _route_key(routed)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(routed)
+        return candidates
+
+    def _prepare_plan(
+        self,
+        primary: dict[str, Any],
+        image_urls: list[str] | None,
+        audio_urls: list[str] | None,
+        func_tool: Any,
+    ) -> dict[str, Any]:
+        """构造本次请求的候选链与冷却策略。"""
+        store = get_store()
+        fb = store.fallback_config()
+        enabled = bool(fb.get("enabled"))
+        candidates = self._build_candidates(
+            primary, image_urls, audio_urls, func_tool
+        )
+        max_attempts = (
+            max(1, int(fb.get("max_attempts") or 3)) if enabled else 1
+        )
+        skip_cooling = enabled
+
+        cooling = [
+            store.is_cooling(
+                routed["instance"]["id"],
+                routed["model_name"],
+                (routed.get("source") or {}).get("id", ""),
+            )
+            for routed in candidates
+        ]
+        if enabled and candidates and all(cooling):
+            if len(candidates) > 1:
+                logger.warning(
+                    "[LLM Manager] 所有候选均在冷却，按原顺序尝试一次：%s",
+                    " -> ".join(_describe_route(c) for c in candidates),
+                )
+            max_attempts = 1
+            skip_cooling = False
+
+        return {
+            "enabled": enabled,
+            "candidates": candidates,
+            "max_attempts": max_attempts,
+            "skip_cooling": skip_cooling,
+            "cooldown_seconds": int(fb.get("cooldown_seconds") or 0),
+        }
+
+    def _handle_failure(
+        self,
+        exc: BaseException,
+        routed: dict[str, Any],
+        cooldown_seconds: int,
+        enabled: bool,
+    ) -> bool:
+        """记录失败并按需标记冷却，返回是否值得尝试下一个候选。"""
+        retryable, scope, reason = _classify_error(exc)
+        if enabled and retryable and cooldown_seconds > 0:
+            source_id = (routed.get("source") or {}).get("id", "")
+            get_store().mark_cooldown(
+                routed["instance"]["id"],
+                routed["model_name"],
+                source_id,
+                cooldown_seconds,
+                scope,
+            )
+        log = logger.info if enabled else logger.debug
+        log(
+            "[LLM Manager] 模型调用失败 | %s | %s | 原因=%s | 可重试=%s",
+            _describe_route(routed), _error_label(exc), reason, retryable,
+        )
+        return retryable
+
+    def _on_success(
+        self,
+        primary: dict[str, Any],
+        routed: dict[str, Any],
+        umo: str | None,
+        usage: dict[str, int] | None,
+    ) -> None:
+        """成功收尾：清冷却、sticky 提升、记录 token。"""
+        store = get_store()
+        source_id = (routed.get("source") or {}).get("id", "")
+        store.clear_cooldown(
+            routed["instance"]["id"], routed["model_name"], source_id
+        )
+
+        used_fallback = _route_key(primary) != _route_key(routed)
+        if used_fallback:
+            logger.info(
+                "[LLM Manager] 故障转移成功 | %s -> %s",
+                _describe_route(primary), _describe_route(routed),
+            )
+            if store.fallback_config().get("mode") == "sticky" and umo:
+                target = (
+                    f"{routed['instance']['id']}/{routed['model_name']}"
+                )
+                try:
+                    if store.set_conversation_override(umo, target):
+                        logger.info(
+                            "[LLM Manager] sticky 已把当前会话切换到 %s", target
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[LLM Manager] sticky 会话切换失败：%s", e)
+
+        self._record_usage(routed, usage, primary)
+
     # ---------- 文本对话（非流式）----------
 
     async def text_chat(
@@ -356,38 +657,73 @@ class LLMManagerProvider(Provider):
         request_max_retries: int | None = None,
         **kwargs: Any,
     ) -> str:
-        routed = self._route(model, session_id, kwargs)
-        backend = self._backend_for(routed["source"])
-        self._apply_model_to_backend(backend, routed["model_name"])
+        primary = self._route(model, session_id, kwargs)
+        store = get_store()
+        plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
+        umo = _conversation_key(session_id, kwargs)
 
-        image_urls, audio_urls, func_tool = self._filter_by_modalities(
-            routed["model_entry"], image_urls, audio_urls, func_tool
-        )
-
-        response = await backend.text_chat(
-            prompt=prompt,
-            session_id=session_id,
-            image_urls=image_urls,
-            audio_urls=audio_urls,
-            func_tool=func_tool,
-            contexts=contexts,
-            system_prompt=system_prompt,
-            tool_calls_result=tool_calls_result,
-            model=routed["model_name"],
-            extra_user_content_parts=extra_user_content_parts,
-            tool_choice=tool_choice,
-            request_max_retries=request_max_retries,
+        base_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "session_id": session_id,
+            "contexts": contexts,
+            "system_prompt": system_prompt,
+            "tool_calls_result": tool_calls_result,
+            "extra_user_content_parts": extra_user_content_parts,
+            "tool_choice": tool_choice,
+            "request_max_retries": request_max_retries,
             **kwargs,
-        )
+        }
 
-        # 记录 token 消耗（不影响主流程，失败仅记日志）
-        try:
-            usage = _extract_usage(response)
-        except Exception:  # noqa: BLE001
-            usage = None
-        self._record_usage(routed, usage)
+        attempted = 0
+        last_exc: BaseException | None = None
 
-        return response
+        for routed in plan["candidates"]:
+            if attempted >= plan["max_attempts"]:
+                break
+            source_id = (routed.get("source") or {}).get("id", "")
+            if plan["skip_cooling"] and store.is_cooling(
+                routed["instance"]["id"], routed["model_name"], source_id
+            ):
+                logger.debug(
+                    "[LLM Manager] 跳过冷却中的候选：%s", _describe_route(routed)
+                )
+                continue
+
+            attempted += 1
+            try:
+                backend = self._backend_for(routed["source"])
+                self._apply_model_to_backend(backend, routed["model_name"])
+                cur_images, cur_audio, cur_tools = self._filter_by_modalities(
+                    routed["model_entry"], image_urls, audio_urls, func_tool
+                )
+                response = await backend.text_chat(
+                    image_urls=cur_images,
+                    audio_urls=cur_audio,
+                    func_tool=cur_tools,
+                    model=routed["model_name"],
+                    **base_kwargs,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                retryable = self._handle_failure(
+                    e, routed, plan["cooldown_seconds"], plan["enabled"]
+                )
+                if not retryable or attempted >= plan["max_attempts"]:
+                    raise
+                last_exc = e
+                continue
+
+            try:
+                usage = _extract_usage(response)
+            except Exception:  # noqa: BLE001
+                usage = None
+            self._on_success(primary, routed, umo, usage)
+            return response
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("LLM Manager 的候选模型均处于冷却，请稍后重试。")
 
     # ---------- 文本对话（流式）----------
 
@@ -406,39 +742,83 @@ class LLMManagerProvider(Provider):
         request_max_retries: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        routed = self._route(model, session_id, kwargs)
-        backend = self._backend_for(routed["source"])
-        self._apply_model_to_backend(backend, routed["model_name"])
+        primary = self._route(model, session_id, kwargs)
+        store = get_store()
+        plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
+        umo = _conversation_key(session_id, kwargs)
 
-        image_urls, audio_urls, func_tool = self._filter_by_modalities(
-            routed["model_entry"], image_urls, audio_urls, func_tool
-        )
+        base_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "session_id": session_id,
+            "contexts": contexts,
+            "system_prompt": system_prompt,
+            "tool_calls_result": tool_calls_result,
+            "tool_choice": tool_choice,
+            "request_max_retries": request_max_retries,
+            **kwargs,
+        }
 
-        usage: dict[str, int] | None = None
-        try:
-            async for chunk in backend.text_chat_stream(
-                prompt=prompt,
-                session_id=session_id,
-                image_urls=image_urls,
-                audio_urls=audio_urls,
-                func_tool=func_tool,
-                contexts=contexts,
-                system_prompt=system_prompt,
-                tool_calls_result=tool_calls_result,
-                model=routed["model_name"],
-                tool_choice=tool_choice,
-                request_max_retries=request_max_retries,
-                **kwargs,
+        attempted = 0
+        last_exc: BaseException | None = None
+
+        for routed in plan["candidates"]:
+            if attempted >= plan["max_attempts"]:
+                break
+            source_id = (routed.get("source") or {}).get("id", "")
+            if plan["skip_cooling"] and store.is_cooling(
+                routed["instance"]["id"], routed["model_name"], source_id
             ):
-                # 流式响应可能在最后一个 chunk 才携带 usage；
-                # 字符串 chunk 不会有 usage，跳过解析以减少开销。
-                if not isinstance(chunk, str):
-                    try:
-                        candidate = _extract_usage(chunk)
-                    except Exception:  # noqa: BLE001
-                        candidate = None
-                    if candidate:
-                        usage = candidate
-                yield chunk
-        finally:
-            self._record_usage(routed, usage)
+                logger.debug(
+                    "[LLM Manager] 跳过冷却中的候选：%s", _describe_route(routed)
+                )
+                continue
+
+            attempted += 1
+            usage: dict[str, int] | None = None
+            visible = False
+            try:
+                backend = self._backend_for(routed["source"])
+                self._apply_model_to_backend(backend, routed["model_name"])
+                cur_images, cur_audio, cur_tools = self._filter_by_modalities(
+                    routed["model_entry"], image_urls, audio_urls, func_tool
+                )
+                async for chunk in backend.text_chat_stream(
+                    image_urls=cur_images,
+                    audio_urls=cur_audio,
+                    func_tool=cur_tools,
+                    model=routed["model_name"],
+                    **base_kwargs,
+                ):
+                    # 空 chunk 不转发，也不算“已经输出”，仍允许故障转移
+                    if isinstance(chunk, str):
+                        if not chunk:
+                            continue
+                        visible = True
+                    else:
+                        # 非字符串 chunk（工具调用/用量）一旦出现就不再切换
+                        visible = True
+                        try:
+                            candidate = _extract_usage(chunk)
+                        except Exception:  # noqa: BLE001
+                            candidate = None
+                        if candidate:
+                            usage = candidate
+                    yield chunk
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                retryable = self._handle_failure(
+                    e, routed, plan["cooldown_seconds"], plan["enabled"]
+                )
+                # 已经向用户输出过内容后不再切换，避免两段拼接；其余情况交给调用方
+                if visible or not retryable or attempted >= plan["max_attempts"]:
+                    raise
+                last_exc = e
+                continue
+            else:
+                self._on_success(primary, routed, umo, usage)
+                return
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("LLM Manager 的候选模型均处于冷却，请稍后重试。")

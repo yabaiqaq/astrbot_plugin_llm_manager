@@ -14,6 +14,7 @@
   group   分组实例管理（add/rm/enable/disable）
   model   模型挂载管理（add/rm）
   rm      统一删除（source/instance/model）
+  fallback 备选池与故障转移（add/rm/move/clear/on/off/mode/max/cooldown/check）
   enable/disable  启停实例
   test    连通性测试
   help    帮助
@@ -213,6 +214,112 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def _fallback_usage() -> str:
+    return (
+        "用法：\n"
+        "  /llmm fallback                       查看开关、模式与备选池\n"
+        "  /llmm fallback add <目标...>          追加备选（目录序号/实例/模型）\n"
+        "  /llmm fallback rm <池序号...>         删除，支持 2-4 区间\n"
+        "  /llmm fallback move <池序号> <新位置> 调整优先级\n"
+        "  /llmm fallback clear confirm          清空并关闭\n"
+        "  /llmm fallback on|off                 启用/停用\n"
+        "  /llmm fallback mode transient|sticky  切换模式\n"
+        "  /llmm fallback max 2-5                总尝试次数（含主模型）\n"
+        "  /llmm fallback cooldown 0-3600        冷却秒数，0 关闭\n"
+        "  /llmm fallback check                  静态校验，不调用模型"
+    )
+
+
+def _parse_pool_indexes(tokens: list[str]) -> tuple[list[int], list[str]]:
+    """解析池序号，支持 `1`、`1 3`、`2-4`、`1,3`；返回 (序号, 无效项)。"""
+    indexes: list[int] = []
+    invalid: list[str] = []
+    for token in tokens:
+        for part in str(token).replace("，", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                left, _, right = part.partition("-")
+                left, right = left.strip(), right.strip()
+                if not (left.isdigit() and right.isdigit()):
+                    invalid.append(part)
+                    continue
+                start, end = int(left), int(right)
+                if start <= 0 or end < start or end - start > 100:
+                    invalid.append(part)
+                    continue
+                for number in range(start, end + 1):
+                    if number not in indexes:
+                        indexes.append(number)
+            elif part.isdigit() and int(part) > 0:
+                number = int(part)
+                if number not in indexes:
+                    indexes.append(number)
+            else:
+                invalid.append(part)
+    return indexes, invalid
+
+
+def _render_fallback(store: Store, umo: str | None = None) -> str:
+    """渲染故障转移配置与备选池状态。"""
+    fb = store.fallback_config()
+    enabled = bool(fb.get("enabled"))
+    mode = str(fb.get("mode") or "transient")
+    attempts = int(fb.get("max_attempts") or 3)
+    cooldown = int(fb.get("cooldown_seconds") or 0)
+
+    primary = store.resolve(umo=umo)
+    primary_text = (
+        f"{primary['instance']['id']}/{primary['model_name']}"
+        if primary else "（尚未配置）"
+    )
+    mode_text = (
+        "成功后仅当前会话切换"
+        if mode == "sticky"
+        else "临时降级，不改变当前选择"
+    )
+    cooldown_text = f"{cooldown} 秒" + ("（已关闭）" if cooldown == 0 else "")
+
+    lines = [
+        f"故障转移：{'开启' if enabled else '关闭'}"
+        + ("" if enabled else "（备选池保留，/llmm fallback on 开启）"),
+        f"模式：{mode}（{mode_text}）",
+        f"主模型：{primary_text}",
+        f"尝试上限：{attempts}（含主模型） · 冷却：{cooldown_text}",
+    ]
+
+    statuses = store.fallback_status()
+    if not statuses:
+        lines.extend([
+            "",
+            "备选池为空。用 /llmm fallback add <目录序号> 添加。",
+        ])
+        return "\n".join(lines)
+
+    lines.extend(["", f"备选池（{len(statuses)}）："])
+    has_bad = False
+    for item in statuses:
+        num = f"  [{item['num']}]" if item["num"] is not None else ""
+        if item["status"] == "missing":
+            status = "失效（实例或模型已删除）"
+            has_bad = True
+        elif item["status"] == "disabled":
+            status = "停用（运行时跳过）"
+            has_bad = True
+        elif item["cooldown"] > 0:
+            status = f"冷却中 {item['cooldown']}s"
+        else:
+            status = "可用"
+        lines.append(
+            f"  {item['index']}. {item['instance_id']}/{item['model']}"
+            f"{num}  {status}"
+        )
+    if has_bad:
+        lines.append("失效/停用条目会被跳过，可用 /llmm fallback check 查看详情。")
+    return "\n".join(lines)
+
+
 def _resolve_and_apply(
     store: Store,
     event: AstrMessageEvent,
@@ -246,7 +353,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "2.1.2")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "2.2.0")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -505,6 +612,287 @@ class LLMManagerPlugin(Star):
         yield event.plain_result(
             f"全局默认已设为 [{item['num']}] {item['model']}（{item['instance_id']}）。"
         )
+
+    # ---------- /llmm fallback ----------
+
+    @llmm.command("fallback")
+    async def llm_fallback(self, event: AstrMessageEvent, arg: str = ""):
+        deny = self._deny_if_not_admin(event)
+        if deny is not None:
+            yield deny
+            return
+
+        tokens = _command_argv(event, "fallback", arg)
+        raw_action = tokens[0].casefold() if tokens else ""
+        params = tokens[1:]
+        aliases = {
+            "status": "list", "show": "list",
+            "enable": "on", "disable": "off",
+            "del": "rm", "remove": "rm", "delete": "rm",
+        }
+        action = aliases.get(raw_action, raw_action) or "list"
+
+        write_actions = {
+            "add", "rm", "move", "clear", "on", "off", "mode", "max", "cooldown",
+        }
+        if action in write_actions and not self._is_bot_admin(event):
+            yield event.plain_result(
+                "此操作仅管理员可用。查看配置请用 /llmm fallback。"
+            )
+            return
+
+        store = get_store()
+
+        if action == "list":
+            yield event.plain_result(
+                _render_fallback(store, event.unified_msg_origin)
+            )
+            return
+
+        if action == "add":
+            if not params:
+                yield event.plain_result(
+                    "用法：/llmm fallback add <目录序号|实例/模型|模型名>...\n"
+                    "例：/llmm fallback add 2 3\n"
+                    "目标与 /llmm use 相同，按给出顺序追加到池尾。"
+                )
+                return
+
+            result = store.add_fallback_targets(params)
+            lines: list[str] = []
+            if result["added"]:
+                lines.append(f"已加入 {len(result['added'])} 条备选：")
+                for offset, item in enumerate(result["added"]):
+                    position = result["start_index"] + offset
+                    suffix = "（已停用，运行时跳过）" if item["disabled"] else ""
+                    lines.append(
+                        f"  {position}. {item['instance_id']}/{item['model']}{suffix}"
+                    )
+            if result["duplicates"]:
+                lines.append(f"跳过重复：{', '.join(result['duplicates'])}")
+            if result["not_found"]:
+                lines.append(f"未找到：{', '.join(result['not_found'])}")
+            if result["overflow"]:
+                lines.append(
+                    f"备选池已满（最多 20 条），未加入：{', '.join(result['overflow'])}"
+                )
+            if not lines:
+                lines.append("没有可加入的条目。")
+            lines.append("")
+            lines.append(_render_fallback(store, event.unified_msg_origin))
+            if result["added"] and not result["enabled"]:
+                lines.append("")
+                lines.append("提示：故障转移尚未开启，执行 /llmm fallback on 生效。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "rm":
+            if not params:
+                yield event.plain_result(
+                    "用法：/llmm fallback rm <池序号...>\n"
+                    "例：/llmm fallback rm 2\n"
+                    "例：/llmm fallback rm 1-3\n"
+                    "池序号以 /llmm fallback 显示为准，不是 /llmm list 的目录序号。"
+                )
+                return
+
+            indexes, invalid = _parse_pool_indexes(params)
+            lines = []
+            if invalid:
+                lines.append(f"无效池序号：{', '.join(invalid)}")
+            if indexes:
+                result = store.remove_fallback_indexes(indexes)
+                if result["removed"]:
+                    lines.append(f"已移除 {len(result['removed'])} 条：")
+                    for item in result["removed"]:
+                        lines.append(
+                            f"  {item['index']}. "
+                            f"{item['instance_id']}/{item['model']}"
+                        )
+                if result["invalid"]:
+                    lines.append(
+                        f"超出范围：{', '.join(str(i) for i in result['invalid'])}"
+                    )
+                if result["auto_disabled"]:
+                    lines.append("备选池已空，故障转移已自动关闭。")
+            if not lines:
+                lines.append("没有移除任何条目。")
+            lines.append("")
+            lines.append(_render_fallback(store, event.unified_msg_origin))
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "move":
+            pool = store.fallback_config()["pool"]
+            if len(params) != 2 or not all(p.isdigit() for p in params):
+                yield event.plain_result(
+                    "用法：/llmm fallback move <池序号> <新位置>\n"
+                    f"例：/llmm fallback move 3 1（把第 3 条提到最前，当前 {len(pool)} 条）"
+                )
+                return
+            index, new_index = int(params[0]), int(params[1])
+            if not store.move_fallback(index, new_index):
+                yield event.plain_result(
+                    f"移动失败：池序号和新位置都需在 1..{len(pool)} 内。"
+                )
+                return
+            yield event.plain_result(
+                f"已把第 {index} 条移动到第 {new_index} 位。\n\n"
+                + _render_fallback(store, event.unified_msg_origin)
+            )
+            return
+
+        if action == "clear":
+            count = len(store.fallback_config()["pool"])
+            if not params or params[0].casefold() not in ("confirm", "确认"):
+                yield event.plain_result(
+                    f"这会清空 {count} 条备选并关闭故障转移。\n"
+                    "确认请执行：/llmm fallback clear confirm"
+                )
+                return
+            cleared = store.clear_fallback()
+            yield event.plain_result(
+                f"已清空 {cleared} 条备选，故障转移已关闭。"
+                if cleared else "备选池本来就是空的。"
+            )
+            return
+
+        if action in ("on", "off"):
+            fb = store.fallback_config()
+            if action == "on":
+                if fb["enabled"]:
+                    yield event.plain_result(
+                        "故障转移已经是开启状态。\n\n"
+                        + _render_fallback(store, event.unified_msg_origin)
+                    )
+                    return
+                if not store.set_fallback_enabled(True):
+                    yield event.plain_result(
+                        "备选池为空，无法开启。先 /llmm fallback add <目录序号> 添加。"
+                    )
+                    return
+                lines = ["故障转移已开启。"]
+                if not store.resolve_fallback_entries():
+                    lines.append(
+                        "注意：池内没有可解析的条目，运行时不会发生转移。"
+                        "用 /llmm fallback check 查看。"
+                    )
+            else:
+                if not fb["enabled"]:
+                    yield event.plain_result(
+                        "当前已是关闭状态。\n\n"
+                        + _render_fallback(store, event.unified_msg_origin)
+                    )
+                    return
+                store.set_fallback_enabled(False)
+                lines = ["故障转移已关闭，备选池保留。"]
+            lines.append("")
+            lines.append(_render_fallback(store, event.unified_msg_origin))
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "mode":
+            fb = store.fallback_config()
+            if not params:
+                yield event.plain_result(
+                    f"当前模式：{fb['mode']}\n"
+                    "  transient：仅本次临时降级，不改变当前选择（推荐）\n"
+                    "  sticky：备选成功后，只把当前会话切到该模型\n"
+                    "用法：/llmm fallback mode transient|sticky"
+                )
+                return
+            mode = params[0].casefold()
+            if mode not in ("transient", "sticky"):
+                yield event.plain_result("模式只能是 transient 或 sticky。")
+                return
+            store.set_fallback_mode(mode)
+            if mode == "sticky":
+                yield event.plain_result(
+                    "已切换为 sticky：备选模型成功后，仅当前会话改用该模型；"
+                    "全局默认不变，/llmm use global 可恢复。"
+                )
+            else:
+                yield event.plain_result(
+                    "已切换为 transient：备选只在本次请求临时生效，不改变当前选择。"
+                )
+            return
+
+        if action == "max":
+            fb = store.fallback_config()
+            if not params:
+                yield event.plain_result(
+                    f"当前尝试上限：{fb['max_attempts']} 次（含主模型）。\n"
+                    "用法：/llmm fallback max 2-5"
+                )
+                return
+            try:
+                value = int(params[0])
+            except ValueError:
+                yield event.plain_result("上限必须是 2-5 的整数。")
+                return
+            if not store.set_fallback_max(value):
+                yield event.plain_result("上限需在 2-5 之间（1 次等于关闭备选，请用 off）。")
+                return
+            yield event.plain_result(
+                f"尝试上限已设为 {value} 次（含主模型，即最多再试 {value - 1} 个备选）。"
+            )
+            return
+
+        if action == "cooldown":
+            fb = store.fallback_config()
+            if not params:
+                yield event.plain_result(
+                    f"当前冷却：{fb['cooldown_seconds']} 秒。\n"
+                    "用法：/llmm fallback cooldown 0-3600（0 表示关闭冷却）"
+                )
+                return
+            try:
+                value = int(params[0])
+            except ValueError:
+                yield event.plain_result("冷却必须是 0-3600 的整数秒。")
+                return
+            if not store.set_fallback_cooldown(value):
+                yield event.plain_result("冷却需在 0-3600 秒之间。")
+                return
+            yield event.plain_result(
+                f"冷却已设为 {value} 秒。"
+                + ("（已关闭冷却）" if value == 0 else "")
+            )
+            return
+
+        if action == "check":
+            statuses = store.fallback_status()
+            if not statuses:
+                yield event.plain_result(
+                    "备选池为空。用 /llmm fallback add <目录序号> 添加。"
+                )
+                return
+            lines = ["备选池检查（未调用模型）："]
+            ok = disabled = missing = 0
+            for item in statuses:
+                num = f" [{item['num']}]" if item["num"] is not None else ""
+                if item["status"] == "missing":
+                    missing += 1
+                    state = "失效：实例或模型已删除"
+                elif item["status"] == "disabled":
+                    disabled += 1
+                    state = "停用：运行时跳过"
+                else:
+                    ok += 1
+                    state = "可解析" + _modality_mark(item["modalities"])
+                    if item["cooldown"] > 0:
+                        state += f"，冷却中 {item['cooldown']}s"
+                lines.append(
+                    f"  {item['index']}. {item['instance_id']}/{item['model']}"
+                    f"{num}  {state}"
+                )
+            lines.append(
+                f"—— 可解析 {ok} 条 / 停用 {disabled} 条 / 失效 {missing} 条 ——"
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        yield event.plain_result(_fallback_usage())
 
     # ---------- /llmm add ----------
 
@@ -902,6 +1290,7 @@ class LLMManagerPlugin(Star):
 
         total_calls = sum(i["calls"] for i in items)
         total_tokens = sum(i["total_tokens"] for i in items)
+        fallback_calls = store.stats.fallback_calls(days)
 
         lines = [
             f"📊 {range_text} 模型 Token 消耗排行",
@@ -924,6 +1313,8 @@ class LLMManagerPlugin(Star):
 
         lines.append("━" * 30)
         lines.append(f"合计: {total_tokens:,} Token | {total_calls} 次调用")
+        if fallback_calls:
+            lines.append(f"其中降级响应: {fallback_calls} 次")
         lines.append("")
         lines.append("提示: /llmm stats 1d | 7d | 30d | all  切换时间范围")
         lines.append("（流式对话需提供商返回 usage 才会记录）")
@@ -1087,6 +1478,17 @@ class LLMManagerPlugin(Star):
             "  /llmm use <序号|模型id|实例id> [-c]   全局切换；-c 仅当前会话\n"
             "  /llmm use global            清除会话切换，回到全局默认\n"
             "  /llmm default <目标>        设置全局默认模型/实例\n"
+            "故障转移（管理员配置，查看跟随 admin_only）：\n"
+            "  /llmm fallback              查看开关、模式与备选池\n"
+            "  /llmm fallback add <目标...>   添加备选（目录序号/实例/模型）\n"
+            "  /llmm fallback rm <池序号...>  删除，支持 1-3 区间\n"
+            "  /llmm fallback move <序号> <新位置>   调整优先级\n"
+            "  /llmm fallback clear confirm   清空并关闭\n"
+            "  /llmm fallback on|off       启用/停用\n"
+            "  /llmm fallback mode transient|sticky\n"
+            "  /llmm fallback max 2-5      总尝试次数（含主模型）\n"
+            "  /llmm fallback cooldown 0-3600   冷却秒数\n"
+            "  /llmm fallback check        静态校验，不调用模型\n"
             "管理（管理员）：\n"
             "  /llmm import                 从系统配置(cmd_config.json)导入已有供应商\n"
             "  /llmm add <站名> <base_url> <key> [类型]   新增后端源\n"

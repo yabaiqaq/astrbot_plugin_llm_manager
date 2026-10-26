@@ -24,7 +24,75 @@ from .stats import Stats
 #: 未显式声明能力时，模型默认具备的能力
 DEFAULT_MODALITIES = ["text", "tool_use"]
 
-STORE_VERSION = 1
+STORE_VERSION = 2
+
+#: 故障转移模式：transient 仅本次降级；sticky 成功后把当前会话切到备选模型
+FALLBACK_MODES = ("transient", "sticky")
+MIN_FALLBACK_ATTEMPTS = 2
+MAX_FALLBACK_ATTEMPTS = 5
+MAX_FALLBACK_POOL = 20
+DEFAULT_FALLBACK_MAX_ATTEMPTS = 3
+DEFAULT_FALLBACK_COOLDOWN = 120
+MAX_FALLBACK_COOLDOWN = 3600
+
+
+def _fallback_defaults() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "mode": "transient",
+        "max_attempts": DEFAULT_FALLBACK_MAX_ATTEMPTS,
+        "cooldown_seconds": DEFAULT_FALLBACK_COOLDOWN,
+        "pool": [],
+    }
+
+
+def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def _normalize_fallback(raw: Any) -> dict[str, Any]:
+    """清洗 fallback 配置，保证字段类型与取值范围安全。"""
+    result = _fallback_defaults()
+    if isinstance(raw, dict):
+        result.update(raw)
+
+    result["enabled"] = bool(result.get("enabled", False))
+    mode = str(result.get("mode") or "transient").strip().lower()
+    result["mode"] = mode if mode in FALLBACK_MODES else "transient"
+    result["max_attempts"] = _clamp_int(
+        result.get("max_attempts"),
+        MIN_FALLBACK_ATTEMPTS,
+        MAX_FALLBACK_ATTEMPTS,
+        DEFAULT_FALLBACK_MAX_ATTEMPTS,
+    )
+    result["cooldown_seconds"] = _clamp_int(
+        result.get("cooldown_seconds"),
+        0,
+        MAX_FALLBACK_COOLDOWN,
+        DEFAULT_FALLBACK_COOLDOWN,
+    )
+
+    pool: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    raw_pool = result.get("pool")
+    for entry in raw_pool if isinstance(raw_pool, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        instance_id = str(entry.get("instance_id") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        key = (instance_id, model)
+        if not instance_id or not model or key in seen:
+            continue
+        seen.add(key)
+        pool.append({"instance_id": instance_id, "model": model})
+        if len(pool) >= MAX_FALLBACK_POOL:
+            break
+    result["pool"] = pool
+    return result
 
 
 def sanitize_id(raw: str) -> str:
@@ -57,6 +125,10 @@ class Store:
         self.data: dict[str, Any] = self._load()
         # Token 消耗统计（与 backends.json 同目录的 stats.json）
         self.stats = Stats(self.path.parent / "stats.json")
+        # 运行时健康状态（进程内，不写盘）：故障转移冷却
+        self._cooldown_lock = threading.Lock()
+        self._model_cooldowns: dict[tuple[str, str], float] = {}
+        self._source_cooldowns: dict[str, float] = {}
 
     # ---------- 基础 ----------
 
@@ -68,6 +140,8 @@ class Store:
             "sources": [],
             # umo -> {"instance_id": ..., "model": ...}（会话级切换）
             "overrides": {},
+            # 当前模型不可用时的顺序降级池
+            "fallback": _fallback_defaults(),
         }
 
     def _normalize_data(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -97,6 +171,8 @@ class Store:
         for key in ("default_instance", "default_model"):
             if not isinstance(merged.get(key), str):
                 merged[key] = ""
+        merged["fallback"] = _normalize_fallback(merged.get("fallback"))
+        merged["version"] = STORE_VERSION
         return merged
 
     def _load(self) -> dict[str, Any]:
@@ -539,6 +615,285 @@ class Store:
             "model_name": item["model"],
             "model_entry": model_entry,
         }
+
+    # ---------- 故障转移：备选池 ----------
+
+    def fallback_config(self) -> dict[str, Any]:
+        """返回规范化后的 fallback 配置；缺失时补默认值。"""
+        fb = self.data.get("fallback")
+        if not isinstance(fb, dict):
+            fb = _normalize_fallback(fb)
+            self.data["fallback"] = fb
+        return fb
+
+    def set_fallback_enabled(self, enabled: bool) -> bool:
+        """启用/停用故障转移。空池时拒绝启用。"""
+        fb = self.fallback_config()
+        if enabled and not fb["pool"]:
+            return False
+        fb["enabled"] = bool(enabled)
+        self.save()
+        return True
+
+    def set_fallback_mode(self, mode: str) -> bool:
+        mode = str(mode or "").strip().lower()
+        if mode not in FALLBACK_MODES:
+            return False
+        self.fallback_config()["mode"] = mode
+        self.save()
+        return True
+
+    def set_fallback_max(self, attempts: int) -> bool:
+        try:
+            value = int(attempts)
+        except (TypeError, ValueError):
+            return False
+        if not MIN_FALLBACK_ATTEMPTS <= value <= MAX_FALLBACK_ATTEMPTS:
+            return False
+        self.fallback_config()["max_attempts"] = value
+        self.save()
+        return True
+
+    def set_fallback_cooldown(self, seconds: int) -> bool:
+        try:
+            value = int(seconds)
+        except (TypeError, ValueError):
+            return False
+        if not 0 <= value <= MAX_FALLBACK_COOLDOWN:
+            return False
+        self.fallback_config()["cooldown_seconds"] = value
+        self.save()
+        return True
+
+    def add_fallback_targets(self, targets: list[str]) -> dict[str, Any]:
+        """按目标解析并追加到备选池，返回详细结果（不抛异常）。"""
+        fb = self.fallback_config()
+        pool: list[dict[str, str]] = fb["pool"]
+        existing = {(e["instance_id"], e["model"]) for e in pool}
+        start_index = len(pool) + 1
+        added: list[dict[str, Any]] = []
+        duplicates: list[str] = []
+        not_found: list[str] = []
+        overflow: list[str] = []
+
+        for target in targets:
+            target = str(target).strip()
+            if not target:
+                continue
+            item = self.find_in_catalog(target)
+            if item is None:
+                not_found.append(target)
+                continue
+            key = (item["instance_id"], item["model"])
+            if key in existing:
+                duplicates.append(target)
+                continue
+            if len(pool) >= MAX_FALLBACK_POOL:
+                overflow.append(target)
+                continue
+            entry = {"instance_id": item["instance_id"], "model": item["model"]}
+            pool.append(entry)
+            existing.add(key)
+            added.append({
+                "num": item["num"],
+                "instance_id": item["instance_id"],
+                "model": item["model"],
+                "disabled": bool(item["disabled"]),
+            })
+
+        if added:
+            self.save()
+        return {
+            "added": added,
+            "duplicates": duplicates,
+            "not_found": not_found,
+            "overflow": overflow,
+            "start_index": start_index,
+            "pool_size": len(pool),
+            "enabled": bool(fb["enabled"]),
+        }
+
+    def remove_fallback_indexes(self, indexes: list[int]) -> dict[str, Any]:
+        """按 1-based 池序号删除；池清空后自动关闭故障转移。"""
+        fb = self.fallback_config()
+        pool: list[dict[str, str]] = fb["pool"]
+        valid: list[int] = []
+        invalid: list[int] = []
+        for index in indexes:
+            if 1 <= index <= len(pool):
+                if index not in valid:
+                    valid.append(index)
+            else:
+                invalid.append(index)
+
+        removed: list[dict[str, Any]] = []
+        for index in sorted(valid, reverse=True):
+            entry = pool.pop(index - 1)
+            removed.append({
+                "index": index,
+                "instance_id": entry["instance_id"],
+                "model": entry["model"],
+            })
+        removed.sort(key=lambda x: x["index"])
+
+        if removed:
+            auto_disabled = False
+            if not pool and fb["enabled"]:
+                fb["enabled"] = False
+                auto_disabled = True
+            self.save()
+        else:
+            auto_disabled = False
+
+        return {
+            "removed": removed,
+            "invalid": invalid,
+            "pool_size": len(pool),
+            "enabled": bool(fb["enabled"]),
+            "auto_disabled": auto_disabled,
+        }
+
+    def move_fallback(self, index: int, new_index: int) -> bool:
+        """把 1-based 池序号移动到新位置。"""
+        pool: list[dict[str, str]] = self.fallback_config()["pool"]
+        if not (1 <= index <= len(pool) and 1 <= new_index <= len(pool)):
+            return False
+        if index == new_index:
+            return True
+        entry = pool.pop(index - 1)
+        pool.insert(new_index - 1, entry)
+        self.save()
+        return True
+
+    def clear_fallback(self) -> int:
+        """清空备选池并自动关闭故障转移，返回清除条数。"""
+        fb = self.fallback_config()
+        count = len(fb["pool"])
+        was_enabled = bool(fb["enabled"])
+        fb["pool"] = []
+        fb["enabled"] = False
+        if count or was_enabled:
+            self.save()
+        return count
+
+    def resolve_fallback_entries(
+        self,
+        required_modalities: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """把池内条目解析成可用路由；跳过缺失、停用、重复和能力不满足的条目。"""
+        catalog = self.build_catalog()
+        index = {
+            (item["instance_id"], item["model"]): item for item in catalog
+        }
+        required = set(required_modalities or ())
+        result: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in self.fallback_config()["pool"]:
+            key = (entry["instance_id"], entry["model"])
+            if key in seen:
+                continue
+            item = index.get(key)
+            if item is None or item["disabled"]:
+                continue
+            if required and not required.issubset(set(item["modalities"])):
+                continue
+            seen.add(key)
+            result.append(self._to_routed(item))
+        return result
+
+    def fallback_status(self) -> list[dict[str, Any]]:
+        """返回备选池的展示状态（含冷却剩余秒数），不发起任何调用。"""
+        catalog = self.build_catalog()
+        index = {
+            (item["instance_id"], item["model"]): item for item in catalog
+        }
+        result: list[dict[str, Any]] = []
+        for position, entry in enumerate(self.fallback_config()["pool"], 1):
+            key = (entry["instance_id"], entry["model"])
+            item = index.get(key)
+            if item is None:
+                status = "missing"
+            elif item["disabled"]:
+                status = "disabled"
+            else:
+                status = "ok"
+            source_id = item["source_id"] if item else ""
+            remaining = self.cooldown_remaining(
+                entry["instance_id"], entry["model"], source_id
+            )
+            result.append({
+                "index": position,
+                "instance_id": entry["instance_id"],
+                "model": entry["model"],
+                "status": status,
+                "num": item["num"] if item else None,
+                "modalities": list(item["modalities"]) if item else [],
+                "source_id": source_id,
+                "cooldown": remaining,
+            })
+        return result
+
+    # ---------- 运行时冷却（不持久化）----------
+
+    def mark_cooldown(
+        self,
+        instance_id: str,
+        model: str,
+        source_id: str,
+        seconds: int,
+        scope: str = "model",
+    ) -> None:
+        """标记模型或整个 source 冷却。seconds <= 0 表示不冷却。"""
+        if seconds <= 0:
+            return
+        until = time.monotonic() + int(seconds)
+        with self._cooldown_lock:
+            now = time.monotonic()
+            self._model_cooldowns = {
+                key: value for key, value in self._model_cooldowns.items()
+                if value > now
+            }
+            self._source_cooldowns = {
+                key: value for key, value in self._source_cooldowns.items()
+                if value > now
+            }
+            if scope == "source" and source_id:
+                self._source_cooldowns[source_id] = until
+            else:
+                self._model_cooldowns[(instance_id, model)] = until
+
+    def clear_cooldown(self, instance_id: str, model: str, source_id: str) -> None:
+        """调用成功后清除该模型与 source 的冷却。"""
+        with self._cooldown_lock:
+            self._model_cooldowns.pop((instance_id, model), None)
+            if source_id:
+                self._source_cooldowns.pop(source_id, None)
+
+    def cooldown_remaining(
+        self,
+        instance_id: str,
+        model: str,
+        source_id: str = "",
+    ) -> int:
+        """返回剩余冷却秒数（向上取整），0 表示未冷却。"""
+        with self._cooldown_lock:
+            now = time.monotonic()
+            until = self._model_cooldowns.get((instance_id, model), 0.0)
+            if source_id:
+                until = max(until, self._source_cooldowns.get(source_id, 0.0))
+        remaining = until - now
+        if remaining <= 0:
+            return 0
+        return int(remaining) + (1 if remaining % 1 else 0)
+
+    def is_cooling(self, instance_id: str, model: str, source_id: str = "") -> bool:
+        return self.cooldown_remaining(instance_id, model, source_id) > 0
+
+    def reset_cooldowns(self) -> None:
+        """清空全部运行时冷却（测试与手动恢复用）。"""
+        with self._cooldown_lock:
+            self._model_cooldowns.clear()
+            self._source_cooldowns.clear()
 
     # ---------- 从 AstrBot 系统配置导入 ----------
 

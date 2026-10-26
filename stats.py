@@ -67,17 +67,21 @@ class Stats:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        fallback_from: str = "",
     ) -> None:
-        """记录一次调用的 token 消耗。"""
+        """记录一次成功调用的 token 消耗；fallback_from 非空表示发生过降级。"""
+        rec = {
+            "ts": int(time.time()),
+            "model": str(model),
+            "instance": str(instance_id),
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+        }
+        if fallback_from:
+            rec["fallback_from"] = str(fallback_from)
         with self._lock:
-            self._data.setdefault("records", []).append({
-                "ts": int(time.time()),
-                "model": str(model),
-                "instance": str(instance_id),
-                "prompt_tokens": int(prompt_tokens or 0),
-                "completion_tokens": int(completion_tokens or 0),
-                "total_tokens": int(total_tokens or 0),
-            })
+            self._data.setdefault("records", []).append(rec)
             self._prune_locked()
             self._save()
 
@@ -135,6 +139,17 @@ class Stats:
     def total_tokens(self, days: int | None = None) -> int:
         """统计总 token 消耗。"""
         return sum(item["total_tokens"] for item in self.aggregate(days))
+
+    def fallback_calls(self, days: int | None = None) -> int:
+        """统计发生过降级的成功响应次数。"""
+        cutoff = None
+        if days is not None:
+            cutoff = int(time.time()) - days * 86400
+        return sum(
+            1 for r in self._data.get("records", [])
+            if r.get("fallback_from")
+            and (cutoff is None or r.get("ts", 0) >= cutoff)
+        )
 
     def record_count(self) -> int:
         """当前存储的原始记录数。"""
