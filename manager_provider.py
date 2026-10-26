@@ -456,6 +456,40 @@ class LLMManagerProvider(Provider):
 
     # ---------- 路由 ----------
 
+    def _release_stale_sticky(self, store: Any, umo: str | None) -> None:
+        """撤销已失去意义的故障转移会话切换。
+
+        sticky 只在主模型故障冷却期间有意义。一旦全局主模型不再冷却，
+        继续沿用备用模型会让人误以为“降级后永远回不去”，因此在路由前
+        自动清除由 fallback 写入的 override，让下一轮重新探测主模型。
+        用户通过 /llmm use -c 手动设置的切换没有 origin 标记，不受影响。
+        """
+        if not umo:
+            return
+        override = store.get_conversation_override(umo)
+        if not override or override.get("origin") != "fallback":
+            return
+
+        default = store.resolve(umo=None)
+        if default is None:
+            return
+        override_key = (override.get("instance_id"), override.get("model"))
+        default_key = (default["instance"]["id"], default["model_name"])
+        if override_key == default_key:
+            return
+
+        source_id = (default.get("source") or {}).get("id", "")
+        if store.is_cooling(
+            default["instance"]["id"], default["model_name"], source_id
+        ):
+            return
+
+        if store.clear_conversation_override(umo):
+            logger.info(
+                "[LLM Manager] 主模型冷却结束，撤销故障转移会话切换并重新探测：%s",
+                _describe_route(default),
+            )
+
     def _route(
         self,
         model: str | None,
@@ -478,6 +512,7 @@ class LLMManagerProvider(Provider):
 
         umo = _conversation_key(session_id, kwargs)
         store = get_store()
+        self._release_stale_sticky(store, umo)
         routed = store.resolve(req_model=model, umo=umo)
 
         # 诊断日志
@@ -626,16 +661,21 @@ class LLMManagerProvider(Provider):
                 _describe_route(primary), _describe_route(routed),
             )
             if store.fallback_config().get("mode") == "sticky" and umo:
-                target = (
-                    f"{routed['instance']['id']}/{routed['model_name']}"
-                )
-                try:
-                    if store.set_conversation_override(umo, target):
-                        logger.info(
-                            "[LLM Manager] sticky 已把当前会话切换到 %s", target
-                        )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("[LLM Manager] sticky 会话切换失败：%s", e)
+                current = store.get_conversation_override(umo)
+                # 用户手动 /llmm use -c 选择的会话不自动粘滞，避免覆盖用户意图。
+                if current is None or current.get("origin") == "fallback":
+                    target = (
+                        f"{routed['instance']['id']}/{routed['model_name']}"
+                    )
+                    try:
+                        if store.set_conversation_override(
+                            umo, target, origin="fallback"
+                        ):
+                            logger.info(
+                                "[LLM Manager] sticky 已把当前会话切换到 %s", target
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[LLM Manager] sticky 会话切换失败：%s", e)
 
         self._record_usage(routed, usage, primary)
 
@@ -677,12 +717,18 @@ class LLMManagerProvider(Provider):
         attempted = 0
         last_exc: BaseException | None = None
 
-        for routed in plan["candidates"]:
+        for index, routed in enumerate(plan["candidates"]):
             if attempted >= plan["max_attempts"]:
                 break
             source_id = (routed.get("source") or {}).get("id", "")
-            if plan["skip_cooling"] and store.is_cooling(
-                routed["instance"]["id"], routed["model_name"], source_id
+            # 候选链首位始终探测一次：主模型恢复后能立刻回到主模型，
+            # 不会因为残留冷却被长期跳过。冷却只用于跳过后续备选。
+            if (
+                index > 0
+                and plan["skip_cooling"]
+                and store.is_cooling(
+                    routed["instance"]["id"], routed["model_name"], source_id
+                )
             ):
                 logger.debug(
                     "[LLM Manager] 跳过冷却中的候选：%s", _describe_route(routed)
@@ -761,12 +807,17 @@ class LLMManagerProvider(Provider):
         attempted = 0
         last_exc: BaseException | None = None
 
-        for routed in plan["candidates"]:
+        for index, routed in enumerate(plan["candidates"]):
             if attempted >= plan["max_attempts"]:
                 break
             source_id = (routed.get("source") or {}).get("id", "")
-            if plan["skip_cooling"] and store.is_cooling(
-                routed["instance"]["id"], routed["model_name"], source_id
+            # 首位候选始终探测一次，避免主模型恢复后仍被冷却长期跳过。
+            if (
+                index > 0
+                and plan["skip_cooling"]
+                and store.is_cooling(
+                    routed["instance"]["id"], routed["model_name"], source_id
+                )
             ):
                 logger.debug(
                     "[LLM Manager] 跳过冷却中的候选：%s", _describe_route(routed)

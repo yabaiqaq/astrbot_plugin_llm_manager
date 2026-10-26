@@ -510,15 +510,27 @@ class Store:
         )
         return item
 
-    def set_conversation_override(self, umo: str, target: str) -> dict[str, Any] | None:
-        """设置会话级切换（同时保存实例与模型，保证精确路由）。"""
+    def set_conversation_override(
+        self,
+        umo: str,
+        target: str,
+        origin: str = "user",
+    ) -> dict[str, Any] | None:
+        """设置会话级切换（同时保存实例与模型，保证精确路由）。
+
+        origin="fallback" 表示该切换由故障转移自动写入，主模型恢复后可由
+        路由层自动撤销；普通用户切换不写 origin，保持长期有效。
+        """
         item = self.find_in_catalog(target)
         if item is None:
             return None
-        self.data.setdefault("overrides", {})[umo] = {
+        record: dict[str, str] = {
             "instance_id": item["instance_id"],
             "model": item["model"],
         }
+        if origin and origin != "user":
+            record["origin"] = str(origin)
+        self.data.setdefault("overrides", {})[umo] = record
         self.save()
         return item
 
@@ -538,10 +550,14 @@ class Store:
         if isinstance(raw, str):
             return {"instance_id": raw, "model": ""}
         if isinstance(raw, dict):
-            return {
+            result = {
                 "instance_id": str(raw.get("instance_id") or ""),
                 "model": str(raw.get("model") or ""),
             }
+            origin = str(raw.get("origin") or "")
+            if origin:
+                result["origin"] = origin
+            return result
         return None
 
     def resolve(

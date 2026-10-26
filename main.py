@@ -269,15 +269,15 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
     attempts = int(fb.get("max_attempts") or 3)
     cooldown = int(fb.get("cooldown_seconds") or 0)
 
-    primary = store.resolve(umo=umo)
+    default = store.resolve(umo=None)
     primary_text = (
-        f"{primary['instance']['id']}/{primary['model_name']}"
-        if primary else "（尚未配置）"
+        f"{default['instance']['id']}/{default['model_name']}"
+        if default else "（尚未配置）"
     )
     mode_text = (
-        "成功后仅当前会话切换"
+        "仅当前会话粘滞，主模型冷却结束后自动恢复"
         if mode == "sticky"
-        else "临时降级，不改变当前选择"
+        else "每轮先试主模型，失败才临时降级"
     )
     cooldown_text = f"{cooldown} 秒" + ("（已关闭）" if cooldown == 0 else "")
 
@@ -288,6 +288,26 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
         f"主模型：{primary_text}",
         f"尝试上限：{attempts}（含主模型） · 冷却：{cooldown_text}",
     ]
+
+    if default:
+        remaining = store.cooldown_remaining(
+            default["instance"]["id"],
+            default["model_name"],
+            (default.get("source") or {}).get("id", ""),
+        )
+        if remaining > 0:
+            lines.append(f"主模型冷却：剩余 {remaining} 秒")
+
+    override = store.get_conversation_override(umo) if umo else None
+    if override and override.get("model"):
+        origin = override.get("origin")
+        label = "故障转移粘滞" if origin == "fallback" else "手动切换"
+        lines.append(
+            f"当前会话：{override['instance_id']}/{override['model']}（{label}）"
+        )
+        lines.append("  恢复全局默认：/llmm use global")
+        if origin == "fallback":
+            lines.append("  主模型冷却结束后会自动恢复。")
 
     statuses = store.fallback_status()
     if not statuses:
@@ -353,7 +373,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.0")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.1")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -796,8 +816,8 @@ class LLMManagerPlugin(Star):
             if not params:
                 yield event.plain_result(
                     f"当前模式：{fb['mode']}\n"
-                    "  transient：仅本次临时降级，不改变当前选择（推荐）\n"
-                    "  sticky：备选成功后，只把当前会话切到该模型\n"
+                    "  transient：每轮先试主模型，失败才临时降级（推荐）\n"
+                    "  sticky：成功后当前会话粘滞，主模型冷却结束后自动恢复\n"
                     "用法：/llmm fallback mode transient|sticky"
                 )
                 return
@@ -809,11 +829,13 @@ class LLMManagerPlugin(Star):
             if mode == "sticky":
                 yield event.plain_result(
                     "已切换为 sticky：备选模型成功后，仅当前会话改用该模型；"
-                    "全局默认不变，/llmm use global 可恢复。"
+                    "主模型冷却结束后自动恢复。全局默认不变，"
+                    "/llmm use global 可立即恢复。"
                 )
             else:
                 yield event.plain_result(
-                    "已切换为 transient：备选只在本次请求临时生效，不改变当前选择。"
+                    "已切换为 transient：每轮都会先尝试主模型，失败才临时降级，"
+                    "不改变当前选择。"
                 )
             return
 

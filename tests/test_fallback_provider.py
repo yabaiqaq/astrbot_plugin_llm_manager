@@ -119,8 +119,28 @@ class FailoverProviderTest(unittest.TestCase):
         FakeBackend.calls = []
         asyncio.run(self.provider.text_chat(prompt="hi"))
         self.assertEqual(
-            [call[2] for call in FakeBackend.calls], ["m2"],
-            "冷却中的主模型应在后续请求中被跳过",
+            [call[2] for call in FakeBackend.calls], ["m1", "m2"],
+            "主模型每轮都先探测一次，恢复后不会继续被冷却跳过",
+        )
+
+    def test_cooling_fallback_is_skipped(self):
+        self.enable_pool()
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        FakeBackend.text_failures["m2"] = lambda: HTTPError(503)
+        FakeBackend.text_failures["n1"] = lambda: HTTPError(503)
+
+        with self.assertRaises(HTTPError):
+            asyncio.run(self.provider.text_chat(prompt="hi"))
+        self.assertEqual(
+            [call[2] for call in FakeBackend.calls], ["m1", "m2", "n1"]
+        )
+
+        FakeBackend.text_failures = {}
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi"))
+        self.assertEqual(
+            [call[2] for call in FakeBackend.calls], ["m1"],
+            "冷却中的备选应被跳过，主模型成功后不再尝试备选",
         )
 
     def test_non_retryable_error_does_not_fall_back(self):
@@ -197,15 +217,53 @@ class FailoverProviderTest(unittest.TestCase):
 
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
 
-        self.assertEqual(
-            self.store.get_conversation_override("sess-1"),
-            {"instance_id": "A_通用", "model": "m2"},
-        )
+        override = self.store.get_conversation_override("sess-1")
+        self.assertEqual(override["instance_id"], "A_通用")
+        self.assertEqual(override["model"], "m2")
+        self.assertEqual(override.get("origin"), "fallback")
         self.assertEqual(self.store.data["default_model"], "m1")
-        self.store.reset_cooldowns()
+
+        # 主模型仍在冷却：本会话继续直接用备选
         FakeBackend.calls = []
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m2"])
+
+    def test_sticky_reverts_after_primary_recovers(self):
+        self.enable_pool(mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+
+        # 主模型冷却结束且已恢复：下一轮应自动回到主模型并撤销粘滞
+        self.store.reset_cooldowns()
+        FakeBackend.text_failures = {}
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m1"])
+        self.assertIsNone(self.store.get_conversation_override("sess-1"))
+
+    def test_sticky_does_not_overwrite_user_session_choice(self):
+        self.enable_pool(mode="sticky")
+        self.store.set_conversation_override("sess-1", "B_通用/n1")
+        FakeBackend.text_failures["n1"] = lambda: HTTPError(503)
+
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["n1", "m2"])
+
+        override = self.store.get_conversation_override("sess-1")
+        self.assertEqual(override["model"], "n1")
+        self.assertNotIn("origin", override)
+
+    def test_user_override_is_not_auto_released(self):
+        self.enable_pool(mode="sticky")
+        self.store.set_conversation_override("sess-1", "m2")
+
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m2"])
+        override = self.store.get_conversation_override("sess-1")
+        self.assertEqual(override["model"], "m2")
+        self.assertNotIn("origin", override)
 
     def test_transient_does_not_write_override(self):
         self.enable_pool(mode="transient")
