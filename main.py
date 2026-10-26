@@ -37,6 +37,7 @@ from .manager_provider import (
     PROVIDER_TYPE_NAME,
     get_store,
     set_store,
+    set_verbose_logging,
 )
 from .register_provider import (
     register_or_replace_provider_adapter,
@@ -373,7 +374,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.1")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.2")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -381,6 +382,7 @@ class LLMManagerPlugin(Star):
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         store = Store(data_dir / "backends.json")
         set_store(store)
+        set_verbose_logging(bool(config.get("verbose_routing_log", True)))
         logger.info("LLM Manager 插件已加载，配置仓库：%s", data_dir / "backends.json")
 
     async def terminate(self) -> None:

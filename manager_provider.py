@@ -32,11 +32,25 @@ _PLUGIN_NAME = "astrbot_plugin_llm_manager"
 #: 模块级 Store 单例，由插件 Star 初始化时注入
 _store: Store | None = None
 
+#: 是否把路由诊断按 INFO 输出；False 时降为 DEBUG
+_verbose_routing_log = True
+
 
 def set_store(store: Store) -> None:
     """由插件主类在 __init__ 时注入共享 Store。"""
     global _store
     _store = store
+
+
+def set_verbose_logging(enabled: bool) -> None:
+    """由插件主类按 WebUI 配置切换路由日志级别。"""
+    global _verbose_routing_log
+    _verbose_routing_log = bool(enabled)
+
+
+def _routing_log(message: str, *args: Any) -> None:
+    """按开关输出路由诊断：开启时 INFO，关闭时 DEBUG。"""
+    (logger.info if _verbose_routing_log else logger.debug)(message, *args)
 
 
 def get_store() -> Store:
@@ -445,8 +459,8 @@ class LLMManagerProvider(Provider):
             except Exception:
                 pass
 
-        # 诊断日志：确认模型已应用（debug，避免每次对话刷 INFO）
-        logger.debug(
+        # 诊断日志：确认模型已应用（受 verbose_routing_log 开关控制）
+        _routing_log(
             "[LLM Manager] 后端模型已设置 | type=%s model_attr=%r config_model=%r",
             type(backend).__name__,
             getattr(backend, "model", "?"),
@@ -522,7 +536,7 @@ class LLMManagerProvider(Provider):
         override_text = (
             f"{override['instance_id']}/{override['model']}" if override else "(无)"
         )
-        logger.debug(
+        _routing_log(
             "[LLM Manager] 路由诊断 | incoming_model=%r placeholder=%r ignored=%s "
             "umo=%r | store default=%s/%s override=%s | routed: instance=%s model=%s",
             incoming_model, configured_model, model_ignored, umo,

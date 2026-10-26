@@ -82,6 +82,33 @@ class ManagerProviderTest(unittest.TestCase):
         self.assertEqual(self.store.stats.record_count(), 1)
         self.assertEqual(self.store.stats.total_tokens(1), 5)
 
+    def test_verbose_routing_log_toggle(self):
+        records = []
+
+        class Recorder:
+            def info(self, message, *args):
+                records.append(("info", message))
+
+            def debug(self, message, *args):
+                records.append(("debug", message))
+
+        original = manager_provider.logger
+        manager_provider.logger = Recorder()
+        self.addCleanup(setattr, manager_provider, "logger", original)
+        self.addCleanup(manager_provider.set_verbose_logging, True)
+        try:
+            manager_provider.set_verbose_logging(True)
+            manager_provider._routing_log("enabled")
+            manager_provider.set_verbose_logging(False)
+            manager_provider._routing_log("disabled")
+        finally:
+            manager_provider.set_verbose_logging(True)
+
+        self.assertEqual(
+            [(level, message) for level, message in records],
+            [("info", "enabled"), ("debug", "disabled")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

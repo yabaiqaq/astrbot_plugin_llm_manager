@@ -516,6 +516,7 @@ A: 冷却到期自动恢复，默认 120 秒；重启插件会立即清空全部
 - **配置仓库**：`data/plugin_data/astrbot_plugin_llm_manager/backends.json`（三级结构 + 默认与会话切换 + 故障转移配置）
 - **统计仓库**：同目录 `stats.json`，降级成功的请求会额外记录 `fallback_from`（原主模型），`/llmm stats` 会显示「其中降级响应」次数
 - **插件配置**：WebUI 插件配置中 `admin_only`（默认开启）控制日常指令是否仅管理员可用；写操作始终仅管理员可用
+- **路由日志**：`verbose_routing_log`（默认开启）控制每条请求的 INFO 路由诊断与后端模型设置日志；关闭后降为 DEBUG，可减少日志量
 - **自动备份**：`/llmm resync` 前会生成 `backends.json.bak`；配置损坏时会重命名为 `backends.json.corrupt-<时间戳>` 保留现场
 - **冷却状态**：只保存在内存中，不写入磁盘，重启即清空
 - 所有 API Key 只存在插件自己的 backends.json 中，不写入 AstrBot 配置
