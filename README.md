@@ -4,7 +4,7 @@
 
 把 AstrBot 的供应商配置收敛为**一个虚拟 Provider**，按三级结构统一管理：
 
-<img title="" src="file:///C:/Users/yabaiqaq/Desktop/llm供应商管理/astrbot_plugin_llm_manager/docs/examples/PixPin_2026-10-26_15-50-36.jpg" alt="" width="376">
+<img title="" src="docs/examples/PixPin_2026-10-26_15-50-36.jpg" alt="" width="376">
 
 ```
 第一级  API Base URL
