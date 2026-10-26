@@ -353,7 +353,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "2.2.0")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.0")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
