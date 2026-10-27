@@ -10,5 +10,22 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后这两条日志降为 DEBUG，只在日志级别为 DEBUG 时可见，可减少日志量。"
+  },
+  "fallback_mode": {
+    "description": "故障转移模式：主模型不可用时如何降级。",
+    "type": "string",
+    "options": ["sticky", "transient"],
+    "labels": [
+      "sticky：降级成功后当前会话粘滞到备选模型，主模型冷却结束自动恢复",
+      "transient：临时降级，每轮先探测主模型，失败才按备选池降级"
+    ],
+    "default": "sticky",
+    "hint": "插件启动时按此值设置。运行中可用 /llmm fallback mode 临时切换，重启后仍以这里为准。"
+  },
+  "fallback_cooldown_seconds": {
+    "description": "失败模型/源的冷却秒数，0 表示关闭冷却。",
+    "type": "int",
+    "default": 120,
+    "hint": "插件启动时按此值设置，有效范围 0-3600。运行中可用 /llmm fallback cooldown 临时调整，重启后仍以这里为准。"
   }
 }

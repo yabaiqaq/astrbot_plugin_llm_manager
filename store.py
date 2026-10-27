@@ -39,7 +39,7 @@ MAX_FALLBACK_COOLDOWN = 3600
 def _fallback_defaults() -> dict[str, Any]:
     return {
         "enabled": False,
-        "mode": "transient",
+        "mode": "sticky",
         "max_attempts": DEFAULT_FALLBACK_MAX_ATTEMPTS,
         "cooldown_seconds": DEFAULT_FALLBACK_COOLDOWN,
         "pool": [],
@@ -61,8 +61,8 @@ def _normalize_fallback(raw: Any) -> dict[str, Any]:
         result.update(raw)
 
     result["enabled"] = bool(result.get("enabled", False))
-    mode = str(result.get("mode") or "transient").strip().lower()
-    result["mode"] = mode if mode in FALLBACK_MODES else "transient"
+    mode = str(result.get("mode") or "sticky").strip().lower()
+    result["mode"] = mode if mode in FALLBACK_MODES else "sticky"
     result["max_attempts"] = _clamp_int(
         result.get("max_attempts"),
         MIN_FALLBACK_ATTEMPTS,

@@ -22,7 +22,7 @@ def load_commands(store):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     wanted_functions = {
         "_command_argv", "_fallback_usage", "_parse_pool_indexes",
-        "_render_fallback", "_modality_mark",
+        "_render_fallback", "_modality_mark", "_apply_fallback_config",
     }
     helpers = [
         node for node in tree.body
@@ -42,7 +42,9 @@ def load_commands(store):
         "AstrMessageEvent": object,
         "Store": Store,
         "get_store": lambda: store,
-        "logger": SimpleNamespace(warning=lambda *args: None),
+        "logger": SimpleNamespace(
+            warning=lambda *args: None, info=lambda *args: None
+        ),
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace
@@ -80,8 +82,27 @@ class FallbackCommandTest(unittest.TestCase):
     def test_status_before_configuration(self):
         output, = self.run_command("/llmm fallback")
         self.assertIn("故障转移：关闭", output)
-        self.assertIn("模式：transient", output)
+        self.assertIn("模式：sticky", output)
         self.assertIn("备选池为空", output)
+
+    def test_apply_fallback_config_from_plugin_config(self):
+        apply = self.ns["_apply_fallback_config"]
+        apply(self.store, {"fallback_mode": "transient", "fallback_cooldown_seconds": 300})
+        fb = self.store.fallback_config()
+        self.assertEqual(fb["mode"], "transient")
+        self.assertEqual(fb["cooldown_seconds"], 300)
+
+        # 非法值与缺省键保持现状不变
+        apply(self.store, {"fallback_mode": "weird", "fallback_cooldown_seconds": "x"})
+        self.assertEqual(fb["mode"], "transient")
+        self.assertEqual(fb["cooldown_seconds"], 300)
+        apply(self.store, {})
+        self.assertEqual(fb["mode"], "transient")
+        self.assertEqual(fb["cooldown_seconds"], 300)
+
+        # 越界冷却值被拒绝，仍保持现状
+        apply(self.store, {"fallback_cooldown_seconds": 99999})
+        self.assertEqual(fb["cooldown_seconds"], 300)
 
     def test_add_targets_and_enable(self):
         output, = self.run_command("/llmm fallback add 2 3")

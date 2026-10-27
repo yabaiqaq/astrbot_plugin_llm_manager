@@ -224,11 +224,30 @@ def _fallback_usage() -> str:
         "  /llmm fallback move <池序号> <新位置> 调整优先级\n"
         "  /llmm fallback clear confirm          清空并关闭\n"
         "  /llmm fallback on|off                 启用/停用\n"
-        "  /llmm fallback mode transient|sticky  切换模式\n"
+        "  /llmm fallback mode transient|sticky  切换模式（默认 sticky）\n"
         "  /llmm fallback max 2-5                总尝试次数（含主模型）\n"
         "  /llmm fallback cooldown 0-3600        冷却秒数，0 关闭\n"
         "  /llmm fallback check                  静态校验，不调用模型"
     )
+
+
+def _apply_fallback_config(store: Store, config: dict) -> None:
+    """把插件配置（WebUI）的故障转移模式与冷却应用为启动值。
+
+    指令 /llmm fallback mode|cooldown 的改动是运行时行为，
+    重启后仍以插件配置为准；非法或缺省的值保持现状不变。
+    """
+    fb = store.fallback_config()
+    mode = str(config.get("fallback_mode") or "").strip().lower()
+    if mode and mode != fb["mode"] and store.set_fallback_mode(mode):
+        logger.info("[LLM Manager] 故障转移模式按插件配置设为 %s", fb["mode"])
+
+    try:
+        cooldown = int(config.get("fallback_cooldown_seconds", fb["cooldown_seconds"]))
+    except (TypeError, ValueError):
+        cooldown = fb["cooldown_seconds"]
+    if cooldown != fb["cooldown_seconds"] and store.set_fallback_cooldown(cooldown):
+        logger.info("[LLM Manager] 故障转移冷却按插件配置设为 %s 秒", cooldown)
 
 
 def _parse_pool_indexes(tokens: list[str]) -> tuple[list[int], list[str]]:
@@ -266,7 +285,7 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
     """渲染故障转移配置与备选池状态。"""
     fb = store.fallback_config()
     enabled = bool(fb.get("enabled"))
-    mode = str(fb.get("mode") or "transient")
+    mode = str(fb.get("mode") or "sticky")
     attempts = int(fb.get("max_attempts") or 3)
     cooldown = int(fb.get("cooldown_seconds") or 0)
 
@@ -374,7 +393,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.3")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.4")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -383,6 +402,7 @@ class LLMManagerPlugin(Star):
         store = Store(data_dir / "backends.json")
         set_store(store)
         set_verbose_logging(bool(config.get("verbose_routing_log", True)))
+        _apply_fallback_config(store, config)
         logger.info("LLM Manager 插件已加载，配置仓库：%s", data_dir / "backends.json")
 
     async def terminate(self) -> None:

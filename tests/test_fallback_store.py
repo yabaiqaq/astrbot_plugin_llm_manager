@@ -32,7 +32,7 @@ class FallbackStoreTest(unittest.TestCase):
     def test_defaults_are_disabled_and_safe(self):
         fb = self.store.fallback_config()
         self.assertFalse(fb["enabled"])
-        self.assertEqual(fb["mode"], "transient")
+        self.assertEqual(fb["mode"], "sticky")
         self.assertEqual(fb["max_attempts"], 3)
         self.assertEqual(fb["cooldown_seconds"], 120)
         self.assertEqual(fb["pool"], [])
@@ -57,7 +57,7 @@ class FallbackStoreTest(unittest.TestCase):
         store = Store(self.path)
         fb = store.fallback_config()
         self.assertTrue(fb["enabled"])
-        self.assertEqual(fb["mode"], "transient")
+        self.assertEqual(fb["mode"], "sticky")
         self.assertEqual(fb["max_attempts"], 5)
         self.assertEqual(fb["cooldown_seconds"], 0)
         self.assertEqual(fb["pool"], [{"instance_id": "A_通用", "model": "m1"}])
