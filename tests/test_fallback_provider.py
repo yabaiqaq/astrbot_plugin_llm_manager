@@ -242,6 +242,61 @@ class FailoverProviderTest(unittest.TestCase):
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m1"])
         self.assertIsNone(self.store.get_conversation_override("sess-1"))
 
+    def test_move_pool_takes_effect_after_sticky_pin(self):
+        self.enable_pool(mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual(
+            self.store.get_conversation_override("sess-1")["model"], "m2"
+        )
+
+        # 把 m2 挪到池尾：粘滞应被解除，下一次请求按新顺序 n1 优先
+        self.assertTrue(self.store.move_fallback(1, 2))
+        self.assertIsNone(self.store.get_conversation_override("sess-1"))
+
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m1", "n1"])
+
+    def test_move_pool_clears_stale_cooldown_so_new_order_applies(self):
+        self.enable_pool()
+        self.store.mark_cooldown("B_通用", "n1", "B", 120, "model")
+        self.assertTrue(self.store.move_fallback(1, 2))
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi"))
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m1", "n1"])
+
+    def test_failover_logs_candidate_chain_and_cooling_skip(self):
+        self.enable_pool()
+        self.store.mark_cooldown("B_通用", "n1", "B", 120, "model")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        FakeBackend.text_failures["m2"] = lambda: HTTPError(503)
+
+        records: list[tuple[str, str]] = []
+        fake_logger = SimpleNamespace(
+            info=lambda msg, *a: records.append(("info", msg % a)),
+            debug=lambda msg, *a: records.append(("debug", msg % a)),
+            warning=lambda msg, *a: None,
+        )
+        original = manager_provider.logger
+        manager_provider.logger = fake_logger
+        self.addCleanup(setattr, manager_provider, "logger", original)
+
+        with self.assertRaises(HTTPError):
+            asyncio.run(self.provider.text_chat(prompt="hi"))
+
+        info_messages = [text for level, text in records if level == "info"]
+        self.assertTrue(
+            any("候选顺序" in m and "冷却" in m for m in info_messages),
+            info_messages,
+        )
+        self.assertTrue(
+            any("跳过冷却中的候选" in m and "剩余" in m for m in info_messages),
+            info_messages,
+        )
+
     def test_sticky_does_not_overwrite_user_session_choice(self):
         self.enable_pool(mode="sticky")
         self.store.set_conversation_override("sess-1", "B_通用/n1")

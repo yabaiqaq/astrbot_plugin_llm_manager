@@ -629,6 +629,25 @@ class LLMManagerProvider(Provider):
             "cooldown_seconds": int(fb.get("cooldown_seconds") or 0),
         }
 
+    def _log_candidate_chain(self, plan: dict[str, Any]) -> None:
+        """故障转移发生时输出完整候选顺序，解释“为什么先轮到了它”。"""
+        store = get_store()
+        parts: list[str] = []
+        for position, routed in enumerate(plan["candidates"]):
+            label = _describe_route(routed)
+            if position == 0:
+                label += "(主)"
+            elif plan["skip_cooling"]:
+                remaining = store.cooldown_remaining(
+                    routed["instance"]["id"],
+                    routed["model_name"],
+                    (routed.get("source") or {}).get("id", ""),
+                )
+                if remaining:
+                    label += f"(冷却 {remaining}s，跳过)"
+            parts.append(label)
+        _routing_log("[LLM Manager] 候选顺序 | %s", " -> ".join(parts))
+
     def _handle_failure(
         self,
         exc: BaseException,
@@ -744,8 +763,13 @@ class LLMManagerProvider(Provider):
                     routed["instance"]["id"], routed["model_name"], source_id
                 )
             ):
-                logger.debug(
-                    "[LLM Manager] 跳过冷却中的候选：%s", _describe_route(routed)
+                remaining = store.cooldown_remaining(
+                    routed["instance"]["id"], routed["model_name"], source_id
+                )
+                _routing_log(
+                    "[LLM Manager] 跳过冷却中的候选：%s（剩余 %ss）",
+                    _describe_route(routed),
+                    remaining,
                 )
                 continue
 
@@ -771,6 +795,8 @@ class LLMManagerProvider(Provider):
                 )
                 if not retryable or attempted >= plan["max_attempts"]:
                     raise
+                if last_exc is None:
+                    self._log_candidate_chain(plan)
                 last_exc = e
                 continue
 
@@ -833,8 +859,13 @@ class LLMManagerProvider(Provider):
                     routed["instance"]["id"], routed["model_name"], source_id
                 )
             ):
-                logger.debug(
-                    "[LLM Manager] 跳过冷却中的候选：%s", _describe_route(routed)
+                remaining = store.cooldown_remaining(
+                    routed["instance"]["id"], routed["model_name"], source_id
+                )
+                _routing_log(
+                    "[LLM Manager] 跳过冷却中的候选：%s（剩余 %ss）",
+                    _describe_route(routed),
+                    remaining,
                 )
                 continue
 
@@ -878,6 +909,8 @@ class LLMManagerProvider(Provider):
                 # 已经向用户输出过内容后不再切换，避免两段拼接；其余情况交给调用方
                 if visible or not retryable or attempted >= plan["max_attempts"]:
                     raise
+                if last_exc is None:
+                    self._log_candidate_chain(plan)
                 last_exc = e
                 continue
             else:

@@ -116,6 +116,35 @@ class FallbackStoreTest(unittest.TestCase):
         self.assertEqual(result["removed"], [])
         self.assertEqual(result["invalid"], [0, 2])
 
+    def test_move_clears_pool_cooldowns_and_fallback_overrides(self):
+        self.store.add_fallback_targets(["2", "4"])
+        self.store.set_fallback_enabled(True)
+        self.store.mark_cooldown("B_通用", "n1", "B", 120, "model")
+        self.store.set_conversation_override("sess-auto", "B_通用/n1", origin="fallback")
+        self.store.set_conversation_override("sess-user", "A_通用/m1")
+
+        self.assertTrue(self.store.move_fallback(1, 2))
+
+        self.assertEqual(
+            [e["model"] for e in self.store.fallback_config()["pool"]], ["n1", "m2"]
+        )
+        self.assertFalse(self.store.is_cooling("B_通用", "n1", "B"))
+        self.assertIsNone(self.store.get_conversation_override("sess-auto"))
+        self.assertEqual(
+            self.store.get_conversation_override("sess-user")["model"], "m1",
+            "用户手动切换不应被顺带清除",
+        )
+
+    def test_clear_releases_fallback_overrides(self):
+        self.store.add_fallback_targets(["2"])
+        self.store.set_conversation_override("sess-auto", "A_通用/m2", origin="fallback")
+        self.store.set_conversation_override("sess-user", "A_通用/m1")
+
+        self.store.clear_fallback()
+
+        self.assertIsNone(self.store.get_conversation_override("sess-auto"))
+        self.assertIsNotNone(self.store.get_conversation_override("sess-user"))
+
     def test_clear_disables_and_returns_count(self):
         self.store.add_fallback_targets(["1", "2"])
         self.store.set_fallback_enabled(True)

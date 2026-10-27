@@ -770,7 +770,11 @@ class Store:
         }
 
     def move_fallback(self, index: int, new_index: int) -> bool:
-        """把 1-based 池序号移动到新位置。"""
+        """把 1-based 池序号移动到新位置。
+
+        调整顺序会同时清除该池条目的运行时冷却与故障转移粘滞：
+        否则旧顺序留下的冷却/粘滞会让新顺序“看起来没生效”。
+        """
         pool: list[dict[str, str]] = self.fallback_config()["pool"]
         if not (1 <= index <= len(pool) and 1 <= new_index <= len(pool)):
             return False
@@ -778,7 +782,16 @@ class Store:
             return True
         entry = pool.pop(index - 1)
         pool.insert(new_index - 1, entry)
+        cooled = self._clear_pool_cooldowns()
+        released = self.clear_fallback_overrides()
         self.save()
+        if cooled or released:
+            logger.info(
+                "[LLM Manager] 备选池顺序已调整，清除 %s 个冷却、%s 个故障转移粘滞，"
+                "下一次请求按新顺序重试",
+                cooled,
+                released,
+            )
         return True
 
     def clear_fallback(self) -> int:
@@ -786,11 +799,49 @@ class Store:
         fb = self.fallback_config()
         count = len(fb["pool"])
         was_enabled = bool(fb["enabled"])
+        cooled = self._clear_pool_cooldowns()
         fb["pool"] = []
         fb["enabled"] = False
-        if count or was_enabled:
+        released = self.clear_fallback_overrides()
+        if count or was_enabled or cooled or released:
             self.save()
         return count
+
+    def clear_fallback_overrides(self) -> int:
+        """撤销所有由故障转移写入的会话粘滞，返回撤销条数。
+
+        用户手动 /llmm use -c 的切换没有 origin 标记，不受影响。
+        """
+        overrides = self.data.get("overrides")
+        if not isinstance(overrides, dict) or not overrides:
+            return 0
+        targets = [
+            umo
+            for umo, record in overrides.items()
+            if isinstance(record, dict) and record.get("origin") == "fallback"
+        ]
+        for umo in targets:
+            overrides.pop(umo, None)
+        return len(targets)
+
+    def _clear_pool_cooldowns(self) -> int:
+        """清除备选池条目当前的运行时冷却，返回清理条数。"""
+        catalog = {
+            (item["instance_id"], item["model"]): item
+            for item in self.build_catalog()
+        }
+        cleared = 0
+        with self._cooldown_lock:
+            for entry in self.fallback_config()["pool"]:
+                key = (entry["instance_id"], entry["model"])
+                item = catalog.get(key)
+                source_id = item["source_id"] if item else ""
+                removed = self._model_cooldowns.pop(key, None) is not None
+                if source_id and self._source_cooldowns.pop(source_id, None) is not None:
+                    removed = True
+                if removed:
+                    cleared += 1
+        return cleared
 
     def resolve_fallback_entries(
         self,

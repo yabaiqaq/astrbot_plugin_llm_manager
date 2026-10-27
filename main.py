@@ -374,7 +374,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.2")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.3")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -758,8 +758,14 @@ class LLMManagerPlugin(Star):
                     f"移动失败：池序号和新位置都需在 1..{len(pool)} 内。"
                 )
                 return
+            note = (
+                "顺带清除了该池的运行冷却与故障转移粘滞，下一次请求即按新顺序重试。"
+                if index != new_index else ""
+            )
             yield event.plain_result(
-                f"已把第 {index} 条移动到第 {new_index} 位。\n\n"
+                f"已把第 {index} 条移动到第 {new_index} 位。"
+                + (f"\n{note}" if note else "")
+                + "\n\n"
                 + _render_fallback(store, event.unified_msg_origin)
             )
             return
