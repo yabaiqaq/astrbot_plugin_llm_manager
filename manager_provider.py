@@ -35,6 +35,9 @@ _store: Store | None = None
 #: 是否把路由诊断按 INFO 输出；False 时降为 DEBUG
 _verbose_routing_log = True
 
+#: 有备选可切时委派后端的单次请求超时（秒）；None 表示沿用源配置
+_fallback_timeout: int | None = None
+
 
 def set_store(store: Store) -> None:
     """由插件主类在 __init__ 时注入共享 Store。"""
@@ -51,6 +54,16 @@ def set_verbose_logging(enabled: bool) -> None:
 def _routing_log(message: str, *args: Any) -> None:
     """按开关输出路由诊断：开启时 INFO，关闭时 DEBUG。"""
     (logger.info if _verbose_routing_log else logger.debug)(message, *args)
+
+
+def set_fallback_timeout(seconds: int | None) -> None:
+    """由插件主类按 WebUI 配置设置委派超时；<=0 表示沿用源自身配置。"""
+    global _fallback_timeout
+    try:
+        value = int(seconds or 0)
+    except (TypeError, ValueError):
+        value = 0
+    _fallback_timeout = value if value > 0 else None
 
 
 def get_store() -> Store:
@@ -347,13 +360,22 @@ class LLMManagerProvider(Provider):
 
     # ---------- 后端实例化与缓存 ----------
 
-    def _backend_for(self, source: dict[str, Any]) -> Any:
+    def _backend_for(
+        self,
+        source: dict[str, Any],
+        timeout_seconds: int | None = None,
+    ) -> Any:
         """根据 Source 配置实例化 AstrBot 内置 Provider。
 
         缓存键包含完整后端配置指纹：用户修改 Key、api_base、超时、代理
         或自定义头后会自动重建，不会继续使用旧连接。
+
+        timeout_seconds 仅在有备选可切时传入，用于覆盖源自身超时，
+        让“主模型卡住”能更快交给故障转移。
         """
         cfg = get_store().source_config(source)
+        if timeout_seconds and timeout_seconds > 0:
+            cfg["timeout"] = int(timeout_seconds)
         fingerprint = json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
         source_id = str(cfg.get("id", ""))
         key = (source_id, fingerprint)
@@ -734,6 +756,11 @@ class LLMManagerProvider(Provider):
         store = get_store()
         plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
         umo = _conversation_key(session_id, kwargs)
+        # 有备选可切时，不让 AstrBot 核心的多次重试拖住降级：
+        # 单次尝试失败即交给本插件的故障转移，超时也可由插件配置指定。
+        fast_switch = len(plan["candidates"]) > 1
+        delegated_retries = 1 if fast_switch else request_max_retries
+        delegated_timeout = _fallback_timeout if fast_switch else None
 
         base_kwargs: dict[str, Any] = {
             "prompt": prompt,
@@ -743,7 +770,7 @@ class LLMManagerProvider(Provider):
             "tool_calls_result": tool_calls_result,
             "extra_user_content_parts": extra_user_content_parts,
             "tool_choice": tool_choice,
-            "request_max_retries": request_max_retries,
+            "request_max_retries": delegated_retries,
             **kwargs,
         }
 
@@ -775,7 +802,7 @@ class LLMManagerProvider(Provider):
 
             attempted += 1
             try:
-                backend = self._backend_for(routed["source"])
+                backend = self._backend_for(routed["source"], delegated_timeout)
                 self._apply_model_to_backend(backend, routed["model_name"])
                 cur_images, cur_audio, cur_tools = self._filter_by_modalities(
                     routed["model_entry"], image_urls, audio_urls, func_tool
@@ -832,6 +859,10 @@ class LLMManagerProvider(Provider):
         store = get_store()
         plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
         umo = _conversation_key(session_id, kwargs)
+        # 与 text_chat 一致：有备选时单次尝试即降级，超时按插件配置
+        fast_switch = len(plan["candidates"]) > 1
+        delegated_retries = 1 if fast_switch else request_max_retries
+        delegated_timeout = _fallback_timeout if fast_switch else None
 
         base_kwargs: dict[str, Any] = {
             "prompt": prompt,
@@ -840,7 +871,7 @@ class LLMManagerProvider(Provider):
             "system_prompt": system_prompt,
             "tool_calls_result": tool_calls_result,
             "tool_choice": tool_choice,
-            "request_max_retries": request_max_retries,
+            "request_max_retries": delegated_retries,
             **kwargs,
         }
 
@@ -873,7 +904,7 @@ class LLMManagerProvider(Provider):
             usage: dict[str, int] | None = None
             visible = False
             try:
-                backend = self._backend_for(routed["source"])
+                backend = self._backend_for(routed["source"], delegated_timeout)
                 self._apply_model_to_backend(backend, routed["model_name"])
                 cur_images, cur_audio, cur_tools = self._filter_by_modalities(
                     routed["model_entry"], image_urls, audio_urls, func_tool

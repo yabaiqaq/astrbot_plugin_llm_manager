@@ -53,6 +53,8 @@ class ManagerProviderTest(unittest.TestCase):
         self.store.set_default("m2")
         manager_provider.set_store(self.store)
         manager_provider.provider_cls_map["fake"] = SimpleNamespace(cls_type=FakeBackend)
+        manager_provider.set_fallback_timeout(None)
+        self.addCleanup(manager_provider.set_fallback_timeout, None)
         self.provider = manager_provider.LLMManagerProvider(
             {"model": "main", "type": "llm_manager"}, {}
         )
@@ -66,6 +68,24 @@ class ManagerProviderTest(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(second.provider_config["key"], ["new-key"])
         self.assertEqual(len(self.provider._backend_cache), 1)
+
+    def test_backend_timeout_override_is_cache_keyed(self):
+        source = self.store.find_source("A")
+        default = self.provider._backend_for(source)
+        self.assertEqual(default.provider_config["timeout"], 120)
+
+        fast = self.provider._backend_for(source, 90)
+        self.assertIsNot(default, fast)
+        self.assertEqual(fast.provider_config["timeout"], 90)
+        self.assertIs(fast, self.provider._backend_for(source, 90))
+        self.assertEqual(len(self.provider._backend_cache), 1)
+
+    def test_set_fallback_timeout_normalizes(self):
+        manager_provider.set_fallback_timeout("90")
+        self.assertEqual(manager_provider._fallback_timeout, 90)
+        for value in (0, None, "bad", -5):
+            manager_provider.set_fallback_timeout(value)
+            self.assertIsNone(manager_provider._fallback_timeout, value)
 
     def test_stream_records_usage_once(self):
         async def collect():

@@ -36,6 +36,7 @@ from .manager_provider import (
     LLMManagerProvider,
     PROVIDER_TYPE_NAME,
     get_store,
+    set_fallback_timeout,
     set_store,
     set_verbose_logging,
 )
@@ -393,7 +394,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.4")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.5")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -402,6 +403,7 @@ class LLMManagerPlugin(Star):
         store = Store(data_dir / "backends.json")
         set_store(store)
         set_verbose_logging(bool(config.get("verbose_routing_log", True)))
+        set_fallback_timeout(config.get("fallback_timeout_seconds", 120))
         _apply_fallback_config(store, config)
         logger.info("LLM Manager 插件已加载，配置仓库：%s", data_dir / "backends.json")
 

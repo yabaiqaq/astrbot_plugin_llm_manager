@@ -27,11 +27,14 @@ class FakeBackend:
     text_failures: dict[str, object] = {}
     stream_failures: dict[str, object] = {}
     calls: list[tuple[str, str, str]] = []
+    kwargs_log: list[dict] = []
+    instances: list["FakeBackend"] = []
 
     def __init__(self, cfg, settings) -> None:
         self.provider_config = dict(cfg)
         self.provider_settings = settings
         self.model = str(cfg.get("model") or "")
+        FakeBackend.instances.append(self)
 
     def set_model(self, model: str) -> None:
         self.model = str(model)
@@ -41,6 +44,7 @@ class FakeBackend:
         FakeBackend.calls.append(
             ("text", str(self.provider_config.get("id", "")), model)
         )
+        FakeBackend.kwargs_log.append(dict(kwargs))
         failure = FakeBackend.text_failures.get(model)
         if failure is not None:
             raise failure() if callable(failure) else failure
@@ -53,6 +57,7 @@ class FakeBackend:
         FakeBackend.calls.append(
             ("stream", str(self.provider_config.get("id", "")), model)
         )
+        FakeBackend.kwargs_log.append(dict(kwargs))
         failure = FakeBackend.stream_failures.get(model)
         if failure == "before":
             raise HTTPError(503)
@@ -81,9 +86,13 @@ class FailoverProviderTest(unittest.TestCase):
         manager_provider.provider_cls_map["fake"] = SimpleNamespace(
             cls_type=FakeBackend
         )
+        manager_provider.set_fallback_timeout(None)
+        self.addCleanup(manager_provider.set_fallback_timeout, None)
         FakeBackend.text_failures = {}
         FakeBackend.stream_failures = {}
         FakeBackend.calls = []
+        FakeBackend.kwargs_log = []
+        FakeBackend.instances = []
         self.provider = manager_provider.LLMManagerProvider(
             {"model": "main", "type": "llm_manager"}, {}
         )
@@ -358,6 +367,52 @@ class FailoverProviderTest(unittest.TestCase):
 
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m1"])
         self.assertFalse(self.store.is_cooling("A_通用", "m1", "A"))
+
+    def test_fast_switch_limits_core_retries_to_one(self):
+        self.enable_pool()
+
+        asyncio.run(self.provider.text_chat(prompt="hi", request_max_retries=5))
+
+        self.assertEqual(FakeBackend.kwargs_log[-1]["request_max_retries"], 1)
+
+    def test_fast_switch_applies_to_stream(self):
+        self.enable_pool()
+
+        async def collect():
+            return [chunk async for chunk in self.provider.text_chat_stream(
+                prompt="hi", request_max_retries=5
+            )]
+
+        asyncio.run(collect())
+        self.assertEqual(FakeBackend.kwargs_log[-1]["request_max_retries"], 1)
+
+    def test_core_retries_pass_through_without_fallback(self):
+        asyncio.run(self.provider.text_chat(prompt="hi", request_max_retries=5))
+
+        self.assertEqual(FakeBackend.kwargs_log[-1]["request_max_retries"], 5)
+
+    def test_core_retries_pass_through_with_single_candidate(self):
+        self.enable_pool(targets=("B_通用/n1",))
+        self.store.set_instance_enabled("B_通用", False)
+
+        asyncio.run(self.provider.text_chat(prompt="hi", request_max_retries=5))
+
+        self.assertEqual(FakeBackend.kwargs_log[-1]["request_max_retries"], 5)
+
+    def test_fallback_timeout_overrides_delegated_backend(self):
+        manager_provider.set_fallback_timeout(90)
+        self.enable_pool()
+
+        asyncio.run(self.provider.text_chat(prompt="hi"))
+
+        self.assertEqual(FakeBackend.instances[-1].provider_config["timeout"], 90)
+
+    def test_fallback_timeout_not_applied_without_candidates(self):
+        manager_provider.set_fallback_timeout(90)
+
+        asyncio.run(self.provider.text_chat(prompt="hi"))
+
+        self.assertEqual(FakeBackend.instances[-1].provider_config["timeout"], 120)
 
 
 class ErrorClassifierTest(unittest.TestCase):
