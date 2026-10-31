@@ -14,7 +14,7 @@
   group   分组实例管理（add/rm/enable/disable）
   model   模型挂载管理（add/rm）
   rm      统一删除（source/instance/model）
-  fallback 备选池与故障转移（add/rm/move/clear/on/off/mode/max/cooldown/check）
+  fallback 备选池与故障转移（add/rm/move/clear/on/off/mode/max/cooldown/check/test）
   enable/disable  启停实例
   test    连通性测试
   help    帮助
@@ -228,7 +228,8 @@ def _fallback_usage() -> str:
         "  /llmm fallback mode transient|sticky  切换模式（默认 sticky）\n"
         "  /llmm fallback max 2-5                总尝试次数（含主模型）\n"
         "  /llmm fallback cooldown 0-3600        冷却秒数，0 关闭\n"
-        "  /llmm fallback check                  静态校验，不调用模型"
+        "  /llmm fallback check                  静态校验，不调用模型\n"
+        "  /llmm fallback test                   并行测主模型与备选延迟（会真实调用）"
     )
 
 
@@ -291,10 +292,20 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
     cooldown = int(fb.get("cooldown_seconds") or 0)
 
     default = store.resolve(umo=None)
-    primary_text = (
-        f"{default['instance']['id']}/{default['model_name']}"
-        if default else "（尚未配置）"
-    )
+    primary_num = None
+    if default:
+        for catalog_item in store.build_catalog():
+            if (
+                catalog_item["instance_id"] == default["instance"]["id"]
+                and catalog_item["model"] == default["model_name"]
+            ):
+                primary_num = catalog_item["num"]
+                break
+    primary_text = "（尚未配置）"
+    if default:
+        primary_text = f"{default['instance']['id']}/{default['model_name']}"
+        if primary_num is not None:
+            primary_text = f"[{primary_num}] {primary_text}"
     mode_text = (
         "仅当前会话粘滞，主模型冷却结束后自动恢复"
         if mode == "sticky"
@@ -394,7 +405,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.5")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.6")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -673,6 +684,8 @@ class LLMManagerPlugin(Star):
             "status": "list", "show": "list",
             "enable": "on", "disable": "off",
             "del": "rm", "remove": "rm", "delete": "rm",
+            "latency": "test", "ping": "test", "speed": "test",
+            "延迟": "test", "测速": "test",
         }
         action = aliases.get(raw_action, raw_action) or "list"
 
@@ -941,6 +954,81 @@ class LLMManagerPlugin(Star):
             lines.append(
                 f"—— 可解析 {ok} 条 / 停用 {disabled} 条 / 失效 {missing} 条 ——"
             )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "test":
+            default = store.resolve(umo=None)
+            if default is None:
+                yield event.plain_result("尚未配置任何可用模型。")
+                return
+
+            main_num = None
+            for catalog_item in store.build_catalog():
+                if (
+                    catalog_item["instance_id"] == default["instance"]["id"]
+                    and catalog_item["model"] == default["model_name"]
+                ):
+                    main_num = catalog_item["num"]
+                    break
+            targets = [{
+                "role": "主",
+                "num": main_num,
+                "instance_id": default["instance"]["id"],
+                "model": default["model_name"],
+                "source_id": (default.get("source") or {}).get("id", ""),
+                "disabled": False,
+            }]
+
+            statuses = store.fallback_status()
+            seen = {(default["instance"]["id"], default["model_name"])}
+            skipped = 0
+            for status in statuses:
+                if status["status"] != "ok":
+                    skipped += 1
+                    continue
+                key = (status["instance_id"], status["model"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append({
+                    "role": f"备{status['index']}",
+                    "num": status["num"],
+                    "instance_id": status["instance_id"],
+                    "model": status["model"],
+                    "source_id": status["source_id"],
+                    "disabled": False,
+                })
+
+            raw_results = await asyncio.gather(
+                *[self._test_one_model(store, item) for item in targets],
+                return_exceptions=True,
+            )
+            results = []
+            for i, result in enumerate(raw_results):
+                if isinstance(result, Exception):
+                    results.append((targets[i], False, 0.0, str(result)))
+                else:
+                    results.append(result)
+
+            lines = [f"故障转移延迟测试（并行 {len(results)} 条）："]
+            success_count = 0
+            for item, success, latency, error in results:
+                num = f"[{item['num']}] " if item.get("num") is not None else ""
+                label = (
+                    f"{num}{item['instance_id']}/{item['model']}"
+                    f"（{item['role']}）"
+                )
+                if success:
+                    success_count += 1
+                    lines.append(f"  ✅ {label}  {latency:.0f} ms")
+                else:
+                    lines.append(f"  ❌ {label}  失败：{error}")
+            lines.append(f"—— {success_count}/{len(results)} 成功 ——")
+            if skipped:
+                lines.append(
+                    f"已跳过 {skipped} 条失效/停用备选（/llmm fallback check 查看）"
+                )
             yield event.plain_result("\n".join(lines))
             return
 
@@ -1541,6 +1629,7 @@ class LLMManagerPlugin(Star):
             "  /llmm fallback max 2-5      总尝试次数（含主模型）\n"
             "  /llmm fallback cooldown 0-3600   冷却秒数\n"
             "  /llmm fallback check        静态校验，不调用模型\n"
+            "  /llmm fallback test         并行测主模型与备选延迟（会真实调用）\n"
             "管理（管理员）：\n"
             "  /llmm import                 从系统配置(cmd_config.json)导入已有供应商\n"
             "  /llmm add <站名> <base_url> <key> [类型]   新增后端源\n"

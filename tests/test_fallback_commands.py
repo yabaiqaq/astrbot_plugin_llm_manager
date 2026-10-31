@@ -41,6 +41,7 @@ def load_commands(store):
     namespace = {
         "AstrMessageEvent": object,
         "Store": Store,
+        "asyncio": asyncio,
         "get_store": lambda: store,
         "logger": SimpleNamespace(
             warning=lambda *args: None, info=lambda *args: None
@@ -84,6 +85,10 @@ class FallbackCommandTest(unittest.TestCase):
         self.assertIn("故障转移：关闭", output)
         self.assertIn("模式：sticky", output)
         self.assertIn("备选池为空", output)
+
+    def test_status_shows_primary_catalog_number(self):
+        output, = self.run_command("/llmm fallback")
+        self.assertIn("主模型：[1] A_通用/m1", output)
 
     def test_apply_fallback_config_from_plugin_config(self):
         apply = self.ns["_apply_fallback_config"]
@@ -172,6 +177,30 @@ class FallbackCommandTest(unittest.TestCase):
         self.assertIn("可解析 1 条", output)
         self.assertIn("失效 1 条", output)
         self.assertIn("实例或模型已删除", output)
+
+    def test_fallback_test_reports_latency_per_model(self):
+        self.run_command("/llmm fallback add 2 3")
+        tested = []
+
+        async def fake_test(store, item):
+            tested.append(item["model"])
+            if item["model"] == "m2":
+                return (item, False, 0.0, "boom")
+            return (item, True, 123.0, None)
+
+        self.plugin._test_one_model = fake_test
+        output, = self.run_command("/llmm fallback test")
+        self.assertIn("[1] A_通用/m1（主）", output)
+        self.assertIn("[2] A_通用/m2（备1）", output)
+        self.assertIn("[3] A_通用/m3（备2）", output)
+        self.assertIn("✅", output)
+        self.assertIn("123 ms", output)
+        self.assertIn("失败：boom", output)
+        self.assertIn("2/3 成功", output)
+        self.assertEqual(sorted(tested), ["m1", "m2", "m3"])
+
+        output, = self.run_command("/llmm fallback latency")
+        self.assertIn("2/3 成功", output)
 
     def test_non_admin_can_view_but_cannot_write(self):
         self.is_admin = False

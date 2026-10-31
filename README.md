@@ -397,6 +397,9 @@
 | `max <2-5>`                 | 总尝试次数（含主模型），默认 3                    |
 | `cooldown <0-3600>`         | 失败后的冷却秒数，默认 120（可在插件配置调整）；`0` 表示关闭冷却 |
 | `check`                     | 静态校验备选池（实例/模型是否存在、能力是否兼容），不调用模型     |
+| `test` / `latency`          | 并行测主模型与可解析备选的延迟（真实调用，产生少量 token）      |
+
+状态里的主模型和备选池条目都会带上 `/llmm list` 的目录序号（如 `主模型：[3] A_通用/m1`），方便直接对应目录。`test` 只测可解析的条目，失效/停用的备选会跳过并提示。
 
 **例子：**
 
@@ -408,6 +411,7 @@
 /llmm fallback mode sticky              # 降级成功后本会话粘滞，主模型恢复后自动回退
 /llmm fallback max 4                    # 最多尝试 4 个模型（含主模型）
 /llmm fallback cooldown 300             # 失败模型冷却 5 分钟
+/llmm fallback test                     # 并行测主模型与备选延迟
 /llmm fallback on                       # 开启
 /llmm fallback clear confirm            # 清空并关闭
 ```
