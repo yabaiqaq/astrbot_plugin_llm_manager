@@ -116,6 +116,21 @@ class FallbackStoreTest(unittest.TestCase):
         self.assertEqual(result["removed"], [])
         self.assertEqual(result["invalid"], [0, 2])
 
+    def test_external_reorder_clears_local_cooldowns(self):
+        """另一个实例调序后，本实例的旧冷却也应作废。"""
+        self.store.add_fallback_targets(["m2", "n1"])
+        other = Store(self.path)
+        self.store.mark_cooldown("A_通用", "m2", "A", 120, "model")
+        self.assertTrue(self.store.is_cooling("A_通用", "m2", "A"))
+
+        self.assertTrue(other.move_fallback(2, 1))
+        self.assertTrue(self.store.refresh_if_changed())
+        self.assertFalse(self.store.is_cooling("A_通用", "m2", "A"))
+        self.assertEqual(
+            [entry["model"] for entry in self.store.fallback_config()["pool"]],
+            ["n1", "m2"],
+        )
+
     def test_move_clears_pool_cooldowns_and_fallback_overrides(self):
         self.store.add_fallback_targets(["2", "4"])
         self.store.set_fallback_enabled(True)

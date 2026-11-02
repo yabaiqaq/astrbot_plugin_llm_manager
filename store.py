@@ -123,6 +123,9 @@ class Store:
         self.path = Path(path)
         self._lock = threading.Lock()
         self.data: dict[str, Any] = self._load()
+        # 记录载入时的文件状态，用于发现其他 Store 实例（或热重载前的旧实例）
+        # 写盘后自动重载，避免指令侧与路由侧各自持有一份过期数据。
+        self._file_state: tuple[int, int] | None = self._stat_state()
         # Token 消耗统计（与 backends.json 同目录的 stats.json）
         self.stats = Stats(self.path.parent / "stats.json")
         # 运行时健康状态（进程内，不写盘）：故障转移冷却
@@ -131,6 +134,59 @@ class Store:
         self._source_cooldowns: dict[str, float] = {}
 
     # ---------- 基础 ----------
+
+    def _stat_state(self) -> tuple[int, int] | None:
+        """返回文件 (mtime_ns, size)；文件不存在时返回 None。"""
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def refresh_if_changed(self) -> bool:
+        """磁盘文件被其他 Store 实例改写时重新载入，返回是否发生重载。
+
+        插件热重载或 Provider 懒加载可能产生两个 Store 实例；指令侧的
+        `use global` 若只清了内存和磁盘、路由侧却仍持有旧 override，
+        就会出现“指令显示已恢复、实际还在用备用模型”的假象。
+        """
+        state = self._stat_state()
+        if state is None or state == self._file_state:
+            return False
+        with self._lock:
+            state = self._stat_state()
+            if state is None or state == self._file_state:
+                return False
+            old_pool = self._pool_signature()
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("配置根节点不是对象")
+            except Exception as e:  # noqa: BLE001
+                # 可能是其他实例正在写入，但不能重命名文件抢现场；
+                # 记录本次状态，避免每次请求都刷日志。
+                self._file_state = state
+                logger.warning("[LLM Manager] 配置外部变更读取失败，暂用内存副本：%s", e)
+                return False
+            self.data = self._normalize_data(data)
+            self._file_state = state
+            # 外部调整了备选池顺序时，本实例内存里的旧冷却也应作废，
+            # 否则新顺序仍会被旧冷却跳过（与 move_fallback 的语义一致）。
+            if self._pool_signature() != old_pool:
+                self._clear_pool_cooldowns()
+            return True
+
+    def _pool_signature(self) -> list[tuple[str, str]]:
+        """备选池顺序签名，用于发现外部调序。"""
+        fb = self.data.get("fallback")
+        pool = fb.get("pool") if isinstance(fb, dict) else []
+        if not isinstance(pool, list):
+            return []
+        return [
+            (str(entry.get("instance_id") or ""), str(entry.get("model") or ""))
+            for entry in pool
+            if isinstance(entry, dict)
+        ]
 
     def _default(self) -> dict[str, Any]:
         return {
@@ -206,6 +262,8 @@ class Store:
                 encoding="utf-8",
             )
             tmp.replace(self.path)
+            # 记住自己写出的状态，避免下一次读取把自己刚写的文件当成外部变更
+            self._file_state = self._stat_state()
 
     # ---------- 一级：Source（base_url + key）----------
 
@@ -510,6 +568,37 @@ class Store:
         )
         return item
 
+    def _related_override_keys(self, umo: str) -> list[str]:
+        """找出与 umo 指向同一会话的 override 键。
+
+        指令侧拿到的是完整 umo（如 `Tsumugi:GroupMessage:1121853964`），
+        Provider 侧某些调用链只拿到短 session_id（如 `1121853964`）。
+        两者互为后缀时视为同一会话，但只在**唯一命中**时采用，避免误伤
+        同一数字下属于其他平台/机器人的会话。
+        """
+        if not umo:
+            return []
+        overrides = self.data.get("overrides")
+        if not isinstance(overrides, dict):
+            return []
+        keys: list[str] = []
+        for key in overrides:
+            if not isinstance(key, str) or not key:
+                continue
+            if key == umo or key.endswith(":" + umo) or umo.endswith(":" + key):
+                keys.append(key)
+        return keys
+
+    def _lookup_override_key(self, umo: str) -> str | None:
+        """返回 umo 对应的实际存储键；精确命中优先，其次唯一后缀命中。"""
+        if not umo:
+            return None
+        overrides = self.data.get("overrides")
+        if isinstance(overrides, dict) and umo in overrides:
+            return umo
+        matches = [key for key in self._related_override_keys(umo) if key != umo]
+        return matches[0] if len(matches) == 1 else None
+
     def set_conversation_override(
         self,
         umo: str,
@@ -530,21 +619,31 @@ class Store:
         }
         if origin and origin != "user":
             record["origin"] = str(origin)
-        self.data.setdefault("overrides", {})[umo] = record
+        overrides = self.data.setdefault("overrides", {})
+        # 同一会话若残留另一种写法的键（完整 umo / 短 session_id），合并掉，
+        # 否则清理一个键后另一个仍会继续生效。只在唯一命中时合并，避免误删
+        # 同一数字下其他平台/机器人的会话。
+        related = [key for key in self._related_override_keys(umo) if key != umo]
+        if len(related) == 1:
+            overrides.pop(related[0], None)
+        overrides[umo] = record
         self.save()
         return item
 
     def clear_conversation_override(self, umo: str) -> bool:
         overrides = self.data.setdefault("overrides", {})
-        if umo in overrides:
-            del overrides[umo]
+        key = self._lookup_override_key(umo)
+        if key is not None:
+            del overrides[key]
             self.save()
             return True
         return False
 
     def get_conversation_override(self, umo: str) -> dict[str, str] | None:
         """返回规范化的会话切换；兼容旧版本的纯 instance_id 字符串。"""
-        raw = self.data.setdefault("overrides", {}).get(umo)
+        overrides = self.data.setdefault("overrides", {})
+        key = self._lookup_override_key(umo)
+        raw = overrides.get(key) if key is not None else None
         if not raw:
             return None
         if isinstance(raw, str):

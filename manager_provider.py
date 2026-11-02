@@ -67,11 +67,18 @@ def set_fallback_timeout(seconds: int | None) -> None:
 
 
 def get_store() -> Store:
-    """懒加载 Store（Provider 实例独立于插件 Star 被实例化时兜底）。"""
+    """懒加载 Store（Provider 实例独立于插件 Star 被实例化时兜底）。
+
+    每次取用前检查磁盘是否有外部写入：插件热重载后可能存在两个 Store
+    实例，指令侧清除的会话切换必须让路由侧也立刻看到，否则会出现
+    “指令显示已恢复、实际仍走旧模型”的假象。
+    """
     global _store
     if _store is None:
         data_dir = StarTools.get_data_dir(_PLUGIN_NAME)
         _store = Store(data_dir / "backends.json")
+    else:
+        _store.refresh_if_changed()
     return _store
 
 

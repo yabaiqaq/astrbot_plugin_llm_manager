@@ -193,6 +193,80 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(r["instance"]["id"], "DeepSeek_推理")
         self.assertEqual(r["model_name"], "deepseek-reasoner")
 
+    def test_refresh_if_changed_sees_other_instance_writes(self):
+        """两个 Store 实例（热重载/懒加载）之间应能互相看到落盘变更。"""
+        s = self.seed()
+        other = Store(self.path)
+        other.set_conversation_override(
+            "Tsumugi:GroupMessage:1121853964", "deepseek-v3", origin="fallback"
+        )
+
+        # 旧实例尚未刷新前看不到
+        self.assertIsNone(s.get_conversation_override("Tsumugi:GroupMessage:1121853964"))
+        self.assertTrue(s.refresh_if_changed())
+        override = s.get_conversation_override("Tsumugi:GroupMessage:1121853964")
+        self.assertEqual(override["model"], "deepseek-v3")
+
+        # 指令侧清除后，路由侧刷新也应立即失效
+        self.assertTrue(s.clear_conversation_override("Tsumugi:GroupMessage:1121853964"))
+        self.assertTrue(other.refresh_if_changed())
+        self.assertIsNone(
+            other.get_conversation_override("Tsumugi:GroupMessage:1121853964")
+        )
+        # 没有新变更时不必重复重载
+        self.assertFalse(other.refresh_if_changed())
+
+    def test_override_keys_match_short_session_id(self):
+        """完整 umo 与短 session_id 应指向同一会话切换。"""
+        s = self.seed()
+        full = "Tsumugi:GroupMessage:1121853964"
+        s.set_conversation_override(full, "deepseek-v3")
+
+        override = s.get_conversation_override("1121853964")
+        self.assertEqual(override["model"], "deepseek-v3")
+        self.assertEqual(s.resolve(umo="1121853964")["model_name"], "deepseek-v3")
+
+        self.assertTrue(s.clear_conversation_override("1121853964"))
+        self.assertIsNone(s.get_conversation_override(full))
+
+    def test_set_override_migrates_equivalent_key(self):
+        """用另一种 umo 写法重新设置时，旧键应合并掉。"""
+        s = self.seed()
+        s.data["overrides"]["1121853964"] = {
+            "instance_id": "DeepSeek_通用",
+            "model": "deepseek-v3",
+        }
+        s.set_conversation_override(
+            "Tsumugi:GroupMessage:1121853964", "deepseek-chat"
+        )
+        self.assertNotIn("1121853964", s.data["overrides"])
+        override = s.get_conversation_override(
+            "Tsumugi:GroupMessage:1121853964"
+        )
+        self.assertEqual(override["model"], "deepseek-chat")
+
+    def test_ambiguous_suffix_does_not_merge_other_sessions(self):
+        """短 id 同时匹配多个平台会话时，不擅自合并或清除。"""
+        s = self.seed()
+        s.data["overrides"]["BotA:GroupMessage:42"] = {
+            "instance_id": "DeepSeek_通用",
+            "model": "deepseek-v3",
+        }
+        s.data["overrides"]["BotB:GroupMessage:42"] = {
+            "instance_id": "DeepSeek_推理",
+            "model": "deepseek-reasoner",
+        }
+        s.set_conversation_override("42", "deepseek-chat")
+        self.assertIn("BotA:GroupMessage:42", s.data["overrides"])
+        self.assertIn("BotB:GroupMessage:42", s.data["overrides"])
+        # 精确命中时只删自己，不影响两个完整 umo 的会话
+        self.assertTrue(s.clear_conversation_override("42"))
+        self.assertNotIn("42", s.data["overrides"])
+        self.assertEqual(
+            s.get_conversation_override("BotA:GroupMessage:42")["model"],
+            "deepseek-v3",
+        )
+
     def test_remove_default_model_clears_pointer(self):
         s = self.seed()
         s.set_default("deepseek-v3")

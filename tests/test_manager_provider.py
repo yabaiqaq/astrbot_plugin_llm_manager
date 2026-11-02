@@ -87,6 +87,22 @@ class ManagerProviderTest(unittest.TestCase):
             manager_provider.set_fallback_timeout(value)
             self.assertIsNone(manager_provider._fallback_timeout, value)
 
+    def test_get_store_refreshes_external_writes(self):
+        """路由侧 Store 应看到另一个实例（指令侧）落盘的会话切换。"""
+        other = Store(self.store.path)
+        other.set_conversation_override("sess-ext", "m1", origin="fallback")
+        self.assertIsNone(self.store.get_conversation_override("sess-ext"))
+
+        self.assertIs(manager_provider.get_store(), self.store)
+        self.assertEqual(
+            self.store.get_conversation_override("sess-ext")["model"], "m1"
+        )
+
+        # 反向：路由侧清除后，另一个实例刷新也能立即看到
+        self.store.clear_conversation_override("sess-ext")
+        self.assertTrue(other.refresh_if_changed())
+        self.assertIsNone(other.get_conversation_override("sess-ext"))
+
     def test_stream_records_usage_once(self):
         async def collect():
             return [chunk async for chunk in self.provider.text_chat_stream(prompt="hi")]
