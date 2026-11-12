@@ -307,7 +307,7 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
         if primary_num is not None:
             primary_text = f"[{primary_num}] {primary_text}"
     mode_text = (
-        "仅当前会话粘滞，主模型冷却结束后自动恢复"
+        "主模型失败时全局降级到备选池首个可用模型，主模型冷却结束后自动回到主模型"
         if mode == "sticky"
         else "每轮先试主模型，失败才临时降级"
     )
@@ -330,16 +330,19 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
         if remaining > 0:
             lines.append(f"主模型冷却：剩余 {remaining} 秒")
 
+    degraded = store.degraded_model()
+    if degraded:
+        lines.append(
+            f"全局降级：{degraded['instance_id']}/{degraded['model']}"
+            "（所有会话共用，主模型冷却结束后恢复）"
+        )
+
     override = store.get_conversation_override(umo) if umo else None
     if override and override.get("model"):
-        origin = override.get("origin")
-        label = "故障转移粘滞" if origin == "fallback" else "手动切换"
         lines.append(
-            f"当前会话：{override['instance_id']}/{override['model']}（{label}）"
+            f"当前会话：{override['instance_id']}/{override['model']}（手动切换）"
         )
         lines.append("  恢复全局默认：/llmm use global")
-        if origin == "fallback":
-            lines.append("  主模型冷却结束后会自动恢复。")
 
     statuses = store.fallback_status()
     if not statuses:
@@ -382,12 +385,11 @@ def _resolve_and_apply(
     if target == "global":
         umo = event.unified_msg_origin
         cleared = store.clear_conversation_override(umo)
+        had_degraded = store.clear_degraded()
         cur = store.data.get("default_instance", "")
-        return (
-            f"已清除本会话切换，回到全局默认：{cur or '（未设置）'}"
-            if cleared
-            else f"本会话本就没有独立切换，全局默认：{cur or '（未设置）'}"
-        )
+        if cleared or had_degraded:
+            return f"已恢复到全局默认：{cur or '（未设置）'}"
+        return f"本会话本就没有独立切换，全局默认：{cur or '（未设置）'}"
 
     item = store.find_in_catalog(target)
     if item is None:
@@ -405,7 +407,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.7")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.8")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -794,7 +796,7 @@ class LLMManagerPlugin(Star):
                 )
                 return
             note = (
-                "顺带清除了该池的运行冷却与故障转移粘滞，下一次请求即按新顺序重试。"
+                "顺带清除了该池的运行冷却与全局降级，下一次请求即按新顺序重试。"
                 if index != new_index else ""
             )
             yield event.plain_result(
@@ -860,7 +862,8 @@ class LLMManagerPlugin(Star):
                 yield event.plain_result(
                     f"当前模式：{fb['mode']}\n"
                     "  transient：每轮先试主模型，失败才临时降级（推荐）\n"
-                    "  sticky：成功后当前会话粘滞，主模型冷却结束后自动恢复\n"
+                    "  sticky：主模型失败时全局降级到备选池首个可用模型，\n"
+                    "          主模型冷却结束后自动回到主模型\n"
                     "用法：/llmm fallback mode transient|sticky"
                 )
                 return
@@ -871,9 +874,9 @@ class LLMManagerPlugin(Star):
             store.set_fallback_mode(mode)
             if mode == "sticky":
                 yield event.plain_result(
-                    "已切换为 sticky：备选模型成功后，仅当前会话改用该模型；"
-                    "主模型冷却结束后自动恢复。全局默认不变，"
-                    "/llmm use global 可立即恢复。"
+                    "已切换为 sticky：主模型失败时全局降级到备选池首个可用模型，"
+                    "后续备选依次顶替；主模型冷却结束后自动回到主模型。"
+                    "手动 /llmm use -c 的会话不受影响。"
                 )
             else:
                 yield event.plain_result(

@@ -116,20 +116,95 @@ class FallbackStoreTest(unittest.TestCase):
         self.assertEqual(result["removed"], [])
         self.assertEqual(result["invalid"], [0, 2])
 
-    def test_external_reorder_clears_local_cooldowns(self):
-        """另一个实例调序后，本实例的旧冷却也应作废。"""
+    def test_external_reorder_clears_local_cooldowns_and_degraded(self):
+        """另一个实例调序后，本实例的旧冷却与全局降级也应作废。"""
         self.store.add_fallback_targets(["m2", "n1"])
         other = Store(self.path)
         self.store.mark_cooldown("A_通用", "m2", "A", 120, "model")
+        self.store.set_degraded("A_通用", "m2")
         self.assertTrue(self.store.is_cooling("A_通用", "m2", "A"))
 
         self.assertTrue(other.move_fallback(2, 1))
         self.assertTrue(self.store.refresh_if_changed())
         self.assertFalse(self.store.is_cooling("A_通用", "m2", "A"))
+        self.assertIsNone(self.store.degraded_model())
         self.assertEqual(
             [entry["model"] for entry in self.store.fallback_config()["pool"]],
             ["n1", "m2"],
         )
+
+    def test_route_entry_resolves_exact_model(self):
+        routed = self.store.route_entry("A_通用", "m2")
+        self.assertEqual(routed["instance"]["id"], "A_通用")
+        self.assertEqual(routed["model_name"], "m2")
+        self.assertIsNone(self.store.route_entry("A_通用", "nope"))
+        self.store.set_instance_enabled("A_通用", False)
+        self.assertIsNone(self.store.route_entry("A_通用", "m2"))
+
+    def test_degraded_set_clear_and_persist(self):
+        self.store.add_fallback_targets(["m2"])
+        self.assertIsNone(self.store.degraded_model())
+        self.assertFalse(self.store.clear_degraded())
+
+        self.store.set_degraded("A_通用", "m2")
+        self.assertEqual(
+            self.store.degraded_model(),
+            {"instance_id": "A_通用", "model": "m2"},
+        )
+        # 落盘后另一个实例也能读到
+        self.assertEqual(
+            Store(self.path).degraded_model(),
+            {"instance_id": "A_通用", "model": "m2"},
+        )
+        self.assertTrue(self.store.clear_degraded())
+        self.assertIsNone(self.store.degraded_model())
+
+    def test_degraded_cleared_on_pool_and_mode_edits(self):
+        self.store.add_fallback_targets(["2", "4"])
+        self.store.set_fallback_enabled(True)
+
+        self.store.set_degraded("A_通用", "m2")
+        self.store.move_fallback(1, 2)
+        self.assertIsNone(self.store.degraded_model())
+
+        self.store.set_degraded("A_通用", "m2")
+        self.store.remove_fallback_indexes([1])
+        self.assertIsNone(self.store.degraded_model())
+
+        self.store.set_degraded("A_通用", "m2")
+        self.store.set_fallback_enabled(False)
+        self.assertIsNone(self.store.degraded_model())
+
+        self.store.set_fallback_enabled(True)
+        self.store.set_degraded("A_通用", "m2")
+        self.store.set_fallback_mode("transient")
+        self.assertIsNone(self.store.degraded_model())
+
+        self.store.set_degraded("A_通用", "m2")
+        self.store.clear_fallback()
+        self.assertIsNone(self.store.degraded_model())
+
+    def test_legacy_fallback_overrides_dropped_on_load(self):
+        """v3.0.7 及更早的按会话粘滞应在加载时丢弃，避免继续用旧模型。"""
+        self.path.write_text(json.dumps({
+            "version": STORE_VERSION,
+            "overrides": {
+                "sess-auto": {
+                    "instance_id": "A_通用",
+                    "model": "m2",
+                    "origin": "fallback",
+                },
+                "sess-user": {"instance_id": "A_通用", "model": "m1"},
+            },
+            "degraded": {"instance_id": "", "model": ""},
+        }), encoding="utf-8")
+
+        store = Store(self.path)
+        self.assertIsNone(store.get_conversation_override("sess-auto"))
+        self.assertEqual(
+            store.get_conversation_override("sess-user")["model"], "m1"
+        )
+        self.assertIsNone(store.degraded_model())
 
     def test_move_clears_pool_cooldowns_and_fallback_overrides(self):
         self.store.add_fallback_targets(["2", "4"])
@@ -137,6 +212,7 @@ class FallbackStoreTest(unittest.TestCase):
         self.store.mark_cooldown("B_通用", "n1", "B", 120, "model")
         self.store.set_conversation_override("sess-auto", "B_通用/n1", origin="fallback")
         self.store.set_conversation_override("sess-user", "A_通用/m1")
+        self.store.set_degraded("B_通用", "n1")
 
         self.assertTrue(self.store.move_fallback(1, 2))
 
@@ -145,6 +221,7 @@ class FallbackStoreTest(unittest.TestCase):
         )
         self.assertFalse(self.store.is_cooling("B_通用", "n1", "B"))
         self.assertIsNone(self.store.get_conversation_override("sess-auto"))
+        self.assertIsNone(self.store.degraded_model())
         self.assertEqual(
             self.store.get_conversation_override("sess-user")["model"], "m1",
             "用户手动切换不应被顺带清除",
@@ -154,11 +231,13 @@ class FallbackStoreTest(unittest.TestCase):
         self.store.add_fallback_targets(["2"])
         self.store.set_conversation_override("sess-auto", "A_通用/m2", origin="fallback")
         self.store.set_conversation_override("sess-user", "A_通用/m1")
+        self.store.set_degraded("A_通用", "m2")
 
         self.store.clear_fallback()
 
         self.assertIsNone(self.store.get_conversation_override("sess-auto"))
         self.assertIsNotNone(self.store.get_conversation_override("sess-user"))
+        self.assertIsNone(self.store.degraded_model())
 
     def test_clear_disables_and_returns_count(self):
         self.store.add_fallback_targets(["1", "2"])

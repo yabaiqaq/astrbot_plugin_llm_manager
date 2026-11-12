@@ -220,52 +220,104 @@ class FailoverProviderTest(unittest.TestCase):
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m1"])
         self.assertEqual(self.store.stats.record_count(), 0)
 
-    def test_sticky_updates_only_current_session(self):
+    def test_sticky_degrades_globally_for_all_sessions(self):
         self.enable_pool(mode="sticky")
         FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
 
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
 
-        override = self.store.get_conversation_override("sess-1")
-        self.assertEqual(override["instance_id"], "A_通用")
-        self.assertEqual(override["model"], "m2")
-        self.assertEqual(override.get("origin"), "fallback")
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m1", "m2"])
+        self.assertEqual(
+            self.store.degraded_model(),
+            {"instance_id": "A_通用", "model": "m2"},
+        )
+        self.assertIsNone(self.store.get_conversation_override("sess-1"))
         self.assertEqual(self.store.data["default_model"], "m1")
 
-        # 主模型仍在冷却：本会话继续直接用备选
+        # 其他会话不必再探测主模型，直接使用全局降级目标
         FakeBackend.calls = []
-        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-2"))
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m2"])
+
+    def test_sticky_cascades_to_next_pool_entry(self):
+        self.enable_pool(mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+
+        # 降级目标也失败：继续沿备选池下移，并更新全局降级
+        FakeBackend.text_failures["m2"] = lambda: HTTPError(503)
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-2"))
+
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m2", "n1"])
+        self.assertEqual(
+            self.store.degraded_model(),
+            {"instance_id": "B_通用", "model": "n1"},
+        )
+
+    def test_degraded_target_cooling_switches_to_next_pool_entry(self):
+        self.enable_pool(mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual(self.store.degraded_model()["model"], "m2")
+
+        # 降级目标 m2 也失败进入冷却：下一轮不应再等它超时，直接换下一个
+        self.store.mark_cooldown("A_通用", "m2", "A", 120, "model")
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-2"))
+
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["n1"])
+        self.assertEqual(
+            self.store.degraded_model(),
+            {"instance_id": "B_通用", "model": "n1"},
+        )
 
     def test_sticky_reverts_after_primary_recovers(self):
         self.enable_pool(mode="sticky")
         FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
 
-        # 主模型冷却结束且已恢复：下一轮应自动回到主模型并撤销粘滞
+        # 主模型冷却结束且已恢复：下一轮应自动回到主模型并清除全局降级
         self.store.reset_cooldowns()
         FakeBackend.text_failures = {}
         FakeBackend.calls = []
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
 
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m1"])
-        self.assertIsNone(self.store.get_conversation_override("sess-1"))
+        self.assertIsNone(self.store.degraded_model())
 
-    def test_move_pool_takes_effect_after_sticky_pin(self):
+    def test_move_pool_clears_degraded_and_applies_new_order(self):
         self.enable_pool(mode="sticky")
         FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
         self.assertEqual(
-            self.store.get_conversation_override("sess-1")["model"], "m2"
+            self.store.degraded_model(),
+            {"instance_id": "A_通用", "model": "m2"},
         )
 
-        # 把 m2 挪到池尾：粘滞应被解除，下一次请求按新顺序 n1 优先
+        # 把 m2 挪到池尾：全局降级应被清除，下一次请求按新顺序 n1 优先
         self.assertTrue(self.store.move_fallback(1, 2))
-        self.assertIsNone(self.store.get_conversation_override("sess-1"))
+        self.assertIsNone(self.store.degraded_model())
 
         FakeBackend.calls = []
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m1", "n1"])
+
+    def test_new_pool_entry_moved_before_degraded_takes_over(self):
+        """复现：降级到旧备选后，新增模型并调到它前面，应立即改用新模型。"""
+        self.enable_pool(mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual(self.store.degraded_model()["model"], "m2")
+
+        self.store.add_models("A_通用", ["m3"])  # 目录里新增一个模型
+        self.store.add_fallback_targets(["3"])  # 按序号追加 m3
+        self.assertTrue(self.store.move_fallback(3, 1))  # 提到 m2 之前        self.assertIsNone(self.store.degraded_model())
+
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m1", "m3"])
+        self.assertEqual(self.store.degraded_model()["model"], "m3")
 
     def test_move_pool_clears_stale_cooldown_so_new_order_applies(self):
         self.enable_pool()
@@ -317,6 +369,28 @@ class FailoverProviderTest(unittest.TestCase):
         override = self.store.get_conversation_override("sess-1")
         self.assertEqual(override["model"], "n1")
         self.assertNotIn("origin", override)
+        # 手动会话的降级不写入全局降级状态
+        self.assertIsNone(self.store.degraded_model())
+
+    def test_manual_session_choice_wins_over_global_degrade(self):
+        self.enable_pool(mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual(
+            self.store.degraded_model(),
+            {"instance_id": "A_通用", "model": "m2"},
+        )
+
+        self.store.set_conversation_override("sess-2", "B_通用/n1")
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-2"))
+
+        # 手动切换优先于全局降级，且不会清除全局降级
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["n1"])
+        self.assertEqual(
+            self.store.degraded_model(),
+            {"instance_id": "A_通用", "model": "m2"},
+        )
 
     def test_user_override_is_not_auto_released(self):
         self.enable_pool(mode="sticky")
@@ -328,6 +402,7 @@ class FailoverProviderTest(unittest.TestCase):
         override = self.store.get_conversation_override("sess-1")
         self.assertEqual(override["model"], "m2")
         self.assertNotIn("origin", override)
+        self.assertIsNone(self.store.degraded_model())
 
     def test_transient_does_not_write_override(self):
         self.enable_pool(mode="transient")
@@ -336,6 +411,7 @@ class FailoverProviderTest(unittest.TestCase):
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
 
         self.assertIsNone(self.store.get_conversation_override("sess-1"))
+        self.assertIsNone(self.store.degraded_model())
         self.assertEqual(self.store.data["default_model"], "m1")
 
     def test_max_attempts_caps_calls(self):

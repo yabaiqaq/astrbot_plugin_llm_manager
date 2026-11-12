@@ -26,7 +26,7 @@ DEFAULT_MODALITIES = ["text", "tool_use"]
 
 STORE_VERSION = 2
 
-#: 故障转移模式：transient 仅本次降级；sticky 成功后把当前会话切到备选模型
+#: 故障转移模式：transient 仅本次降级；sticky 写入全局降级，所有会话共用
 FALLBACK_MODES = ("transient", "sticky")
 MIN_FALLBACK_ATTEMPTS = 2
 MAX_FALLBACK_ATTEMPTS = 5
@@ -174,6 +174,7 @@ class Store:
             # 否则新顺序仍会被旧冷却跳过（与 move_fallback 的语义一致）。
             if self._pool_signature() != old_pool:
                 self._clear_pool_cooldowns()
+                self.data["degraded"] = None
             return True
 
     def _pool_signature(self) -> list[tuple[str, str]]:
@@ -194,8 +195,10 @@ class Store:
             "default_instance": "",
             "default_model": "",
             "sources": [],
-            # umo -> {"instance_id": ..., "model": ...}（会话级切换）
+            # umo -> {"instance_id": ..., "model": ...}（手动会话切换）
             "overrides": {},
+            # sticky 模式下的全局降级目标（主模型冷却期间所有会话共用）
+            "degraded": None,
             # 当前模型不可用时的顺序降级池
             "fallback": _fallback_defaults(),
         }
@@ -224,6 +227,20 @@ class Store:
                 ]
         if not isinstance(merged.get("overrides"), dict):
             merged["overrides"] = {}
+        # 旧版本的故障转移粘滞是按会话写入的，v3.0.8 起改为全局降级状态；
+        # 这些旧记录会让人误以为“切不回主模型”，加载时直接丢弃。
+        merged["overrides"] = {
+            key: record
+            for key, record in merged["overrides"].items()
+            if not (isinstance(record, dict) and record.get("origin") == "fallback")
+        }
+        degraded = merged.get("degraded")
+        if not (
+            isinstance(degraded, dict)
+            and str(degraded.get("instance_id") or "").strip()
+            and str(degraded.get("model") or "").strip()
+        ):
+            merged["degraded"] = None
         for key in ("default_instance", "default_model"):
             if not isinstance(merged.get(key), str):
                 merged[key] = ""
@@ -561,6 +578,8 @@ class Store:
             return None
         self.data["default_instance"] = item["instance_id"]
         self.data["default_model"] = item["model"]
+        # 手动改全局主模型后，旧的全局降级不再代表“当前主模型”，立即作废。
+        self.data["degraded"] = None
         self.save()
         logger.info(
             "[LLM Manager] set_default 成功 -> instance=%s model=%s",
@@ -607,8 +626,8 @@ class Store:
     ) -> dict[str, Any] | None:
         """设置会话级切换（同时保存实例与模型，保证精确路由）。
 
-        origin="fallback" 表示该切换由故障转移自动写入，主模型恢复后可由
-        路由层自动撤销；普通用户切换不写 origin，保持长期有效。
+        origin 仅用于兼容旧版本（v3.0.7 及更早会把降级写成本会话粘滞）；
+        v3.0.8 起降级改为全局 `degraded` 状态，不再写入 origin。
         """
         item = self.find_in_catalog(target)
         if item is None:
@@ -731,6 +750,57 @@ class Store:
             "model_entry": model_entry,
         }
 
+    def route_entry(self, instance_id: str, model: str) -> dict[str, Any] | None:
+        """按实例 + 模型精确解析可路由项；不存在或已停用时返回 None。"""
+        for item in self.build_catalog():
+            if (
+                item["instance_id"] == instance_id
+                and item["model"] == model
+                and not item["disabled"]
+            ):
+                return self._to_routed(item)
+        return None
+
+    # ---------- 全局降级（sticky 模式）----------
+
+    def degraded_model(self) -> dict[str, str] | None:
+        """返回当前全局降级目标；无降级时返回 None。"""
+        raw = self.data.get("degraded")
+        if not isinstance(raw, dict):
+            return None
+        instance_id = str(raw.get("instance_id") or "").strip()
+        model = str(raw.get("model") or "").strip()
+        if not instance_id or not model:
+            return None
+        return {"instance_id": instance_id, "model": model}
+
+    def set_degraded(self, instance_id: str, model: str) -> None:
+        """记录全局降级目标（主模型冷却期间所有会话共用）。"""
+        instance_id = str(instance_id or "").strip()
+        model = str(model or "").strip()
+        if not instance_id or not model:
+            return
+        current = self.degraded_model()
+        target = {"instance_id": instance_id, "model": model}
+        if current == target:
+            return
+        self.data["degraded"] = target
+        self.save()
+        logger.info(
+            "[LLM Manager] 全局降级到 %s/%s（主模型冷却期间所有会话共用）",
+            instance_id,
+            model,
+        )
+
+    def clear_degraded(self) -> bool:
+        """清除全局降级状态，返回是否原本存在。"""
+        if self.data.get("degraded") is None:
+            return False
+        self.data["degraded"] = None
+        self.save()
+        logger.info("[LLM Manager] 已清除全局降级，回到按主模型路由")
+        return True
+
     # ---------- 故障转移：备选池 ----------
 
     def fallback_config(self) -> dict[str, Any]:
@@ -746,16 +816,24 @@ class Store:
         fb = self.fallback_config()
         if enabled and not fb["pool"]:
             return False
+        changed = fb["enabled"] != bool(enabled)
         fb["enabled"] = bool(enabled)
-        self.save()
+        if not enabled:
+            self.data["degraded"] = None
+        if changed:
+            self.save()
         return True
 
     def set_fallback_mode(self, mode: str) -> bool:
         mode = str(mode or "").strip().lower()
         if mode not in FALLBACK_MODES:
             return False
+        changed = self.fallback_config()["mode"] != mode
         self.fallback_config()["mode"] = mode
-        self.save()
+        if mode != "sticky":
+            self.data["degraded"] = None
+        if changed:
+            self.save()
         return True
 
     def set_fallback_max(self, attempts: int) -> bool:
@@ -856,6 +934,7 @@ class Store:
             if not pool and fb["enabled"]:
                 fb["enabled"] = False
                 auto_disabled = True
+            self.data["degraded"] = None
             self.save()
         else:
             auto_disabled = False
@@ -871,8 +950,8 @@ class Store:
     def move_fallback(self, index: int, new_index: int) -> bool:
         """把 1-based 池序号移动到新位置。
 
-        调整顺序会同时清除该池条目的运行时冷却与故障转移粘滞：
-        否则旧顺序留下的冷却/粘滞会让新顺序“看起来没生效”。
+        调整顺序会同时清除该池的运行时冷却与全局降级，并清掉旧版本遗留的
+        会话粘滞：否则旧顺序留下的状态会让新顺序“看起来没生效”。
         """
         pool: list[dict[str, str]] = self.fallback_config()["pool"]
         if not (1 <= index <= len(pool) and 1 <= new_index <= len(pool)):
@@ -883,13 +962,16 @@ class Store:
         pool.insert(new_index - 1, entry)
         cooled = self._clear_pool_cooldowns()
         released = self.clear_fallback_overrides()
+        had_degraded = self.data.get("degraded") is not None
+        self.data["degraded"] = None
         self.save()
-        if cooled or released:
+        if cooled or released or had_degraded:
             logger.info(
-                "[LLM Manager] 备选池顺序已调整，清除 %s 个冷却、%s 个故障转移粘滞，"
-                "下一次请求按新顺序重试",
+                "[LLM Manager] 备选池顺序已调整，清除 %s 个冷却、%s 个旧会话粘滞、"
+                "全局降级=%s，下一次请求按新顺序重试",
                 cooled,
                 released,
+                "是" if had_degraded else "否",
             )
         return True
 
@@ -902,13 +984,16 @@ class Store:
         fb["pool"] = []
         fb["enabled"] = False
         released = self.clear_fallback_overrides()
-        if count or was_enabled or cooled or released:
+        had_degraded = self.data.get("degraded") is not None
+        self.data["degraded"] = None
+        if count or was_enabled or cooled or released or had_degraded:
             self.save()
         return count
 
     def clear_fallback_overrides(self) -> int:
-        """撤销所有由故障转移写入的会话粘滞，返回撤销条数。
+        """撤销旧版本写入的会话粘滞（origin=fallback），返回撤销条数。
 
+        v3.0.8 起降级不再写会话粘滞，仅用于清理升级前遗留的数据；
         用户手动 /llmm use -c 的切换没有 origin 标记，不受影响。
         """
         overrides = self.data.get("overrides")

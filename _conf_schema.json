@@ -16,7 +16,7 @@
     "type": "string",
     "options": ["sticky", "transient"],
     "labels": [
-      "sticky：降级成功后当前会话粘滞到备选模型，主模型冷却结束自动恢复",
+      "sticky：主模型失败时全局降级到备选池首个可用模型，主模型冷却结束自动恢复",
       "transient：临时降级，每轮先探测主模型，失败才按备选池降级"
     ],
     "default": "sticky",

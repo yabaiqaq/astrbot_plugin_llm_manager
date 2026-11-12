@@ -90,6 +90,12 @@ class FallbackCommandTest(unittest.TestCase):
         output, = self.run_command("/llmm fallback")
         self.assertIn("主模型：[1] A_通用/m1", output)
 
+    def test_status_shows_global_degrade(self):
+        self.run_command("/llmm fallback add 2")
+        self.store.set_degraded("A_通用", "m2")
+        output, = self.run_command("/llmm fallback")
+        self.assertIn("全局降级：A_通用/m2", output)
+
     def test_apply_fallback_config_from_plugin_config(self):
         apply = self.ns["_apply_fallback_config"]
         apply(self.store, {"fallback_mode": "transient", "fallback_cooldown_seconds": 300})

@@ -90,7 +90,7 @@ class ManagerProviderTest(unittest.TestCase):
     def test_get_store_refreshes_external_writes(self):
         """路由侧 Store 应看到另一个实例（指令侧）落盘的会话切换。"""
         other = Store(self.store.path)
-        other.set_conversation_override("sess-ext", "m1", origin="fallback")
+        other.set_conversation_override("sess-ext", "m1")
         self.assertIsNone(self.store.get_conversation_override("sess-ext"))
 
         self.assertIs(manager_provider.get_store(), self.store)

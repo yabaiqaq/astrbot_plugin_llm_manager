@@ -339,6 +339,14 @@ def _describe_route(routed: dict[str, Any]) -> str:
     return f"{routed['instance']['id']}/{routed['model_name']}"
 
 
+def _is_route_cooling(store: Any, routed: dict[str, Any]) -> bool:
+    return store.is_cooling(
+        routed["instance"]["id"],
+        routed["model_name"],
+        (routed.get("source") or {}).get("id", ""),
+    )
+
+
 class LLMManagerProvider(Provider):
     """虚拟 Provider：注册为 `llm_manager` 类型，路由到真实后端。"""
 
@@ -499,39 +507,98 @@ class LLMManagerProvider(Provider):
 
     # ---------- 路由 ----------
 
-    def _release_stale_sticky(self, store: Any, umo: str | None) -> None:
-        """撤销已失去意义的故障转移会话切换。
+    def _apply_degraded(
+        self,
+        store: Any,
+        routed: dict[str, Any],
+        explicit_model: bool,
+    ) -> dict[str, Any]:
+        """sticky 模式的全局降级：主模型冷却期间所有会话共用降级模型。
 
-        sticky 只在主模型故障冷却期间有意义。一旦全局主模型不再冷却，
-        继续沿用备用模型会让人误以为“降级后永远回不去”，因此在路由前
-        自动清除由 fallback 写入的 override，让下一轮重新探测主模型。
-        用户通过 /llmm use -c 手动设置的切换没有 origin 标记，不受影响。
+        只在“按全局默认路由”的请求上生效；手动 /llmm use -c 与请求显式
+        指定的模型优先。主模型冷却结束后自动清除降级状态，下一轮重新从
+        主模型开始探测。
         """
-        if not umo:
-            return
-        override = store.get_conversation_override(umo)
-        if not override or override.get("origin") != "fallback":
-            return
+        fb = store.fallback_config()
+        if not fb.get("enabled") or fb.get("mode") != "sticky":
+            if store.degraded_model() is not None:
+                store.clear_degraded()
+            return routed
+        if explicit_model:
+            return routed
 
+        degraded = store.degraded_model()
+        if not degraded:
+            return routed
+        default = store.resolve(umo=None)
+        if default is None:
+            store.clear_degraded()
+            return routed
+        # 手动切换或显式模型：不应用全局降级
+        if _route_key(routed) != _route_key(default):
+            return routed
+
+        source_id = (default.get("source") or {}).get("id", "")
+        if not store.is_cooling(
+            default["instance"]["id"], default["model_name"], source_id
+        ):
+            store.clear_degraded()
+            return routed
+
+        target = store.route_entry(degraded["instance_id"], degraded["model"])
+        if target is None:
+            store.clear_degraded()
+            return routed
+        if _is_route_cooling(store, target):
+            # 降级目标自身已失败并冷却：本轮按池顺序改用下一个未冷却的备选，
+            # 避免每次请求都先等它超时一次。
+            replacement = next(
+                (
+                    entry
+                    for entry in store.resolve_fallback_entries()
+                    if _route_key(entry) != _route_key(default)
+                    and not _is_route_cooling(store, entry)
+                ),
+                None,
+            )
+            if replacement is not None:
+                store.set_degraded(
+                    replacement["instance"]["id"], replacement["model_name"]
+                )
+                return replacement
+        return target
+
+    def _update_global_degrade(
+        self,
+        store: Any,
+        primary: dict[str, Any],
+        routed: dict[str, Any],
+        used_fallback: bool,
+    ) -> None:
+        """成功后维护全局降级状态。
+
+        只有从“全局默认”或“当前降级模型”出发的请求才会更新它；手动
+        /llmm use -c 的会话降级不污染其他会话。
+        """
+        fb = store.fallback_config()
+        if not fb.get("enabled") or fb.get("mode") != "sticky":
+            store.clear_degraded()
+            return
         default = store.resolve(umo=None)
         if default is None:
             return
-        override_key = (override.get("instance_id"), override.get("model"))
-        default_key = (default["instance"]["id"], default["model_name"])
-        if override_key == default_key:
+        degraded = store.degraded_model()
+        primary_key = _route_key(primary)
+        default_key = _route_key(default)
+        degraded_key = (
+            (degraded["instance_id"], degraded["model"]) if degraded else None
+        )
+        if primary_key not in (default_key, degraded_key):
             return
-
-        source_id = (default.get("source") or {}).get("id", "")
-        if store.is_cooling(
-            default["instance"]["id"], default["model_name"], source_id
-        ):
-            return
-
-        if store.clear_conversation_override(umo):
-            logger.info(
-                "[LLM Manager] 主模型冷却结束，撤销故障转移会话切换并重新探测：%s",
-                _describe_route(default),
-            )
+        if used_fallback:
+            store.set_degraded(routed["instance"]["id"], routed["model_name"])
+        elif primary_key == default_key:
+            store.clear_degraded()
 
     def _route(
         self,
@@ -555,8 +622,9 @@ class LLMManagerProvider(Provider):
 
         umo = _conversation_key(session_id, kwargs)
         store = get_store()
-        self._release_stale_sticky(store, umo)
         routed = store.resolve(req_model=model, umo=umo)
+        if routed is not None:
+            routed = self._apply_degraded(store, routed, model is not None)
 
         # 诊断日志
         default_inst = store.data.get("default_instance", "")
@@ -565,11 +633,16 @@ class LLMManagerProvider(Provider):
         override_text = (
             f"{override['instance_id']}/{override['model']}" if override else "(无)"
         )
+        degraded = store.degraded_model()
+        degraded_text = (
+            f"{degraded['instance_id']}/{degraded['model']}" if degraded else "(无)"
+        )
         _routing_log(
             "[LLM Manager] 路由诊断 | incoming_model=%r placeholder=%r ignored=%s "
-            "umo=%r | store default=%s/%s override=%s | routed: instance=%s model=%s",
+            "umo=%r | store default=%s/%s override=%s degraded=%s | "
+            "routed: instance=%s model=%s",
             incoming_model, configured_model, model_ignored, umo,
-            default_inst, default_model, override_text,
+            default_inst, default_model, override_text, degraded_text,
             routed["instance"]["id"] if routed else "None",
             routed["model_name"] if routed else "None",
         )
@@ -706,10 +779,9 @@ class LLMManagerProvider(Provider):
         self,
         primary: dict[str, Any],
         routed: dict[str, Any],
-        umo: str | None,
         usage: dict[str, int] | None,
     ) -> None:
-        """成功收尾：清冷却、sticky 提升、记录 token。"""
+        """成功收尾：清冷却、维护全局降级、记录 token。"""
         store = get_store()
         source_id = (routed.get("source") or {}).get("id", "")
         store.clear_cooldown(
@@ -722,22 +794,7 @@ class LLMManagerProvider(Provider):
                 "[LLM Manager] 故障转移成功 | %s -> %s",
                 _describe_route(primary), _describe_route(routed),
             )
-            if store.fallback_config().get("mode") == "sticky" and umo:
-                current = store.get_conversation_override(umo)
-                # 用户手动 /llmm use -c 选择的会话不自动粘滞，避免覆盖用户意图。
-                if current is None or current.get("origin") == "fallback":
-                    target = (
-                        f"{routed['instance']['id']}/{routed['model_name']}"
-                    )
-                    try:
-                        if store.set_conversation_override(
-                            umo, target, origin="fallback"
-                        ):
-                            logger.info(
-                                "[LLM Manager] sticky 已把当前会话切换到 %s", target
-                            )
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("[LLM Manager] sticky 会话切换失败：%s", e)
+        self._update_global_degrade(store, primary, routed, used_fallback)
 
         self._record_usage(routed, usage, primary)
 
@@ -762,7 +819,6 @@ class LLMManagerProvider(Provider):
         primary = self._route(model, session_id, kwargs)
         store = get_store()
         plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
-        umo = _conversation_key(session_id, kwargs)
         # 有备选可切时，不让 AstrBot 核心的多次重试拖住降级：
         # 单次尝试失败即交给本插件的故障转移，超时也可由插件配置指定。
         fast_switch = len(plan["candidates"]) > 1
@@ -838,7 +894,7 @@ class LLMManagerProvider(Provider):
                 usage = _extract_usage(response)
             except Exception:  # noqa: BLE001
                 usage = None
-            self._on_success(primary, routed, umo, usage)
+            self._on_success(primary, routed, usage)
             return response
 
         if last_exc is not None:
@@ -865,7 +921,6 @@ class LLMManagerProvider(Provider):
         primary = self._route(model, session_id, kwargs)
         store = get_store()
         plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
-        umo = _conversation_key(session_id, kwargs)
         # 与 text_chat 一致：有备选时单次尝试即降级，超时按插件配置
         fast_switch = len(plan["candidates"]) > 1
         delegated_retries = 1 if fast_switch else request_max_retries
@@ -952,7 +1007,7 @@ class LLMManagerProvider(Provider):
                 last_exc = e
                 continue
             else:
-                self._on_success(primary, routed, umo, usage)
+                self._on_success(primary, routed, usage)
                 return
 
         if last_exc is not None:

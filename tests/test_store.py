@@ -198,7 +198,7 @@ class StoreTest(unittest.TestCase):
         s = self.seed()
         other = Store(self.path)
         other.set_conversation_override(
-            "Tsumugi:GroupMessage:1121853964", "deepseek-v3", origin="fallback"
+            "Tsumugi:GroupMessage:1121853964", "deepseek-v3"
         )
 
         # 旧实例尚未刷新前看不到
