@@ -23,6 +23,7 @@ def load_commands(store):
     wanted_functions = {
         "_command_argv", "_fallback_usage", "_parse_pool_indexes",
         "_render_fallback", "_modality_mark", "_apply_fallback_config",
+        "_store_api_problems",
     }
     helpers = [
         node for node in tree.body
@@ -43,6 +44,14 @@ def load_commands(store):
         "Store": Store,
         "asyncio": asyncio,
         "get_store": lambda: store,
+        "REQUIRED_STORE_API_VERSION": 1,
+        "_REQUIRED_STORE_METHODS": (
+            "degraded_model",
+            "set_degraded",
+            "clear_degraded",
+            "route_entry",
+            "refresh_if_changed",
+        ),
         "logger": SimpleNamespace(
             warning=lambda *args: None, info=lambda *args: None
         ),
@@ -216,6 +225,23 @@ class FallbackCommandTest(unittest.TestCase):
         output, = self.run_command("/llmm fallback add 1")
         self.assertIn("此操作仅管理员可用", output)
         self.assertEqual(self.store.fallback_config()["pool"], [])
+
+    def test_cooldown_zero_with_sticky_warns_about_probing(self):
+        output, = self.run_command("/llmm fallback cooldown 0")
+        self.assertIn("冷却已设为 0 秒", output)
+        self.assertIn("sticky 模式下 0 秒冷却", output)
+        self.assertEqual(self.store.fallback_config()["cooldown_seconds"], 0)
+
+    def test_store_api_self_check_detects_legacy_class(self):
+        check = self.ns["_store_api_problems"]
+        self.assertEqual(check(self.store), [])
+
+        class LegacyStore:
+            pass
+
+        problems = check(LegacyStore())
+        self.assertTrue(problems)
+        self.assertIn("缺少方法", "；".join(problems))
 
     def test_unknown_action_shows_usage(self):
         output, = self.run_command("/llmm fallback wat")

@@ -316,6 +316,14 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_text(encoding="utf-8"), "{not json")
 
+    def test_unreadable_config_is_not_overwritten(self):
+        self.path.mkdir()  # 让 read_text 抛 OSError（IsADirectoryError）
+
+        s = Store(self.path)
+        self.assertEqual(s.build_catalog(), [])
+        s.add_source("A", "https://a.example/v1", "k")  # save 应被拒绝
+        self.assertTrue(self.path.is_dir(), "读取失败时不能覆盖磁盘现场")
+
     def test_import_reads_agent_runner_default(self):
         s = Store(self.path)
         config = {

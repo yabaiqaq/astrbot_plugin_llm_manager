@@ -11,6 +11,7 @@ tests/_astrbot_stub.py 中为无 astrbot 的环境注入 logger 替身后独立�
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -25,6 +26,21 @@ from .stats import Stats
 DEFAULT_MODALITIES = ["text", "tool_use"]
 
 STORE_VERSION = 2
+
+#: Store 对外 API 版本。主插件启动时据此判断内存里是否残留旧版 Store 类
+#: （覆盖升级后只热重载入口模块，子模块不会被重新导入）。
+STORE_API_VERSION = 1
+
+#: 同一配置文件的进程内共享锁：热重载后可能同时存在多个 Store 实例，
+#: 串行化读写，避免临时文件互相覆盖。
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(str(path)))
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 #: 故障转移模式：transient 仅本次降级；sticky 写入全局降级，所有会话共用
 FALLBACK_MODES = ("transient", "sticky")
@@ -119,14 +135,22 @@ class Store:
     线程安全（写操作加锁），读写采用原子替换（临时文件 + rename）。
     """
 
+    #: 供主插件启动自检；旧版 Store 类没有这个属性
+    STORE_API_VERSION = STORE_API_VERSION
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
+        self._path_lock = _path_lock(self.path)
+        # 读取彻底失败时禁止写盘，避免用空配置覆盖现场
+        self._load_failed = False
         self.data: dict[str, Any] = self._load()
+        # 重名模型只在第一次命中时告警，避免每条请求刷日志
+        self._warned_ambiguous: set[str] = set()
         # 记录载入时的文件状态，用于发现其他 Store 实例（或热重载前的旧实例）
         # 写盘后自动重载，避免指令侧与路由侧各自持有一份过期数据。
         self._file_state: tuple[int, int] | None = self._stat_state()
-        # Token 消耗统计（与 backends.json 同目录的 stats.json）
+        # Token 消耗统计（与 backends.json 同目录的 stats.jsonl）
         self.stats = Stats(self.path.parent / "stats.json")
         # 运行时健康状态（进程内，不写盘）：故障转移冷却
         self._cooldown_lock = threading.Lock()
@@ -153,7 +177,7 @@ class Store:
         state = self._stat_state()
         if state is None or state == self._file_state:
             return False
-        with self._lock:
+        with self._lock, self._path_lock:
             state = self._stat_state()
             if state is None or state == self._file_state:
                 return False
@@ -251,34 +275,73 @@ class Store:
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return self._default()
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("配置根节点不是对象")
-            return self._normalize_data(data)
-        except Exception as e:  # noqa: BLE001
-            backup = self.path.with_name(
-                f"{self.path.name}.corrupt-{int(time.time())}"
-            )
+        # 配置文件可能被杀毒软件或另一个实例短暂占用：先重试几次，
+        # 只有确定内容损坏（JSON 解析失败）才备份改名，避免误伤现场。
+        last_error: Exception | None = None
+        for attempt in range(3):
             try:
-                self.path.replace(backup)
-                logger.warning(
-                    "[LLM Manager] 配置读取失败，已备份到 %s：%s", backup, e
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("配置根节点不是对象")
+                return self._normalize_data(data)
+            except OSError as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                logger.error(
+                    "[LLM Manager] 配置暂时无法读取，已使用空配置启动，"
+                    "磁盘文件未被改动。请检查文件占用后重启：%s",
+                    e,
                 )
-            except OSError:
-                logger.warning("[LLM Manager] 配置读取失败且无法备份：%s", e)
-            return self._default()
+                self._load_failed = True
+                return self._default()
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                break
+
+        backup = self.path.with_name(
+            f"{self.path.name}.corrupt-{int(time.time())}"
+        )
+        try:
+            self.path.replace(backup)
+            logger.warning(
+                "[LLM Manager] 配置读取失败，已备份到 %s：%s", backup, last_error
+            )
+        except OSError:
+            logger.warning(
+                "[LLM Manager] 配置读取失败且无法备份：%s", last_error
+            )
+        return self._default()
 
     def save(self) -> None:
         """持久化（原子写）。"""
-        with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        if self._load_failed:
+            logger.error(
+                "[LLM Manager] 启动时配置读取失败，为避免覆盖磁盘现场，"
+                "本次修改未写入。请检查文件占用并重启 AstrBot 后重试。"
             )
-            tmp.replace(self.path)
+            return
+        with self._lock, self._path_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # 唯一临时名：同目录下多个 Store 实例同时写也不会互相踩掉
+            tmp = self.path.with_name(
+                f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                tmp.write_text(
+                    json.dumps(self.data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                tmp.replace(self.path)
+            finally:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
             # 记住自己写出的状态，避免下一次读取把自己刚写的文件当成外部变更
             self._file_state = self._stat_state()
 
@@ -698,9 +761,21 @@ class Store:
 
         # 1. 请求显式模型
         if req_model:
-            for item in catalog:
-                if item["model"] == req_model and _usable(item):
-                    return self._to_routed(item)
+            matches = [
+                item for item in catalog
+                if item["model"] == req_model and _usable(item)
+            ]
+            if len(matches) > 1 and req_model not in self._warned_ambiguous:
+                self._warned_ambiguous.add(req_model)
+                logger.warning(
+                    "[LLM Manager] 模型名 %r 在 %d 个实例中存在，已按目录顺序选择 "
+                    "%s；如需精确指定请使用 实例ID/模型ID",
+                    req_model,
+                    len(matches),
+                    f"{matches[0]['instance_id']}/{matches[0]['model']}",
+                )
+            if matches:
+                return self._to_routed(matches[0])
 
         # 2. 会话级 override（先精确匹配模型，模型被删/停用时回退到实例）
         if umo:
@@ -1354,7 +1429,10 @@ class Store:
             logger.warning("[LLM Manager] resync 备份失败：%s", e)
 
         # 2. 清空 sources（保留 default/overrides 字段，后面恢复）
+        # 重建后旧的冷却与全局降级都不再代表现有配置，一并作废。
         self.data["sources"] = []
+        self.data["degraded"] = None
+        self.reset_cooldowns()
 
         # 3. 重新导入（import 是幂等的，此时 sources 为空，会全部新建）
         result = self.import_from_astrbot_config(config)

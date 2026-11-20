@@ -80,6 +80,14 @@ class ManagerProviderTest(unittest.TestCase):
         self.assertIs(fast, self.provider._backend_for(source, 90))
         self.assertEqual(len(self.provider._backend_cache), 1)
 
+    def test_backend_cache_separates_models(self):
+        source = self.store.find_source("A")
+        first = self.provider._backend_for(source, None, "m1")
+        second = self.provider._backend_for(source, None, "m2")
+        self.assertIsNot(first, second)
+        self.assertIs(first, self.provider._backend_for(source, None, "m1"))
+        self.assertEqual(len(self.provider._backend_cache), 2)
+
     def test_set_fallback_timeout_normalizes(self):
         manager_provider.set_fallback_timeout("90")
         self.assertEqual(manager_provider._fallback_timeout, 90)

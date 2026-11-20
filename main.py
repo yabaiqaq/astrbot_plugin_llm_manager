@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import os
 import time
@@ -55,6 +56,33 @@ except Exception as e:  # noqa: BLE001
 
 PLUGIN_NAME = "astrbot_plugin_llm_manager"
 PROVIDER_TEMPLATE_KEY = "LLM Manager"
+
+#: 主插件依赖的 Store API 版本；旧版子模块残留时据此给出明确提示
+REQUIRED_STORE_API_VERSION = 1
+_REQUIRED_STORE_METHODS = (
+    "degraded_model",
+    "set_degraded",
+    "clear_degraded",
+    "route_entry",
+    "refresh_if_changed",
+)
+
+
+def _store_api_problems(store: Store) -> list[str]:
+    """检查内存中的 Store 是否具备当前插件所需的 API。"""
+    problems: list[str] = []
+    version = int(getattr(type(store), "STORE_API_VERSION", 0) or 0)
+    if version < REQUIRED_STORE_API_VERSION:
+        problems.append(
+            f"Store API v{version} < 需要的 v{REQUIRED_STORE_API_VERSION}"
+        )
+    missing = [
+        name for name in _REQUIRED_STORE_METHODS
+        if not callable(getattr(store, name, None))
+    ]
+    if missing:
+        problems.append("缺少方法：" + "、".join(missing))
+    return problems
 
 
 def _provider_template() -> dict:
@@ -251,6 +279,13 @@ def _apply_fallback_config(store: Store, config: dict) -> None:
     if cooldown != fb["cooldown_seconds"] and store.set_fallback_cooldown(cooldown):
         logger.info("[LLM Manager] 故障转移冷却按插件配置设为 %s 秒", cooldown)
 
+    if fb["mode"] == "sticky" and int(fb["cooldown_seconds"]) == 0:
+        logger.warning(
+            "[LLM Manager] sticky 模式下冷却为 0：每轮都会先探测主模型，"
+            "主模型故障时每条请求都要等一次主模型超时才切换。"
+            "建议保留至少 30 秒，或把模式改为 transient。"
+        )
+
 
 def _parse_pool_indexes(tokens: list[str]) -> tuple[list[int], list[str]]:
     """解析池序号，支持 `1`、`1 3`、`2-4`、`1,3`；返回 (序号, 无效项)。"""
@@ -312,6 +347,8 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
         else "每轮先试主模型，失败才临时降级"
     )
     cooldown_text = f"{cooldown} 秒" + ("（已关闭）" if cooldown == 0 else "")
+    if cooldown == 0 and mode == "sticky":
+        cooldown_text += "（sticky 下每轮都会先探测主模型）"
 
     lines = [
         f"故障转移：{'开启' if enabled else '关闭'}"
@@ -407,7 +444,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.8")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.9")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -418,6 +455,18 @@ class LLMManagerPlugin(Star):
         set_verbose_logging(bool(config.get("verbose_routing_log", True)))
         set_fallback_timeout(config.get("fallback_timeout_seconds", 120))
         _apply_fallback_config(store, config)
+
+        # 覆盖升级后 AstrBot 通常只重载入口模块，store.py / manager_provider.py
+        # 的旧类仍留在内存里；这里主动识别并提示，避免出现一堆看不懂的
+        # AttributeError 后误以为数据坏了。
+        problems = _store_api_problems(store)
+        if problems:
+            logger.error(
+                "[LLM Manager] 检测到旧版插件子模块仍在内存中（%s）。"
+                "覆盖升级后仅“重载插件”不会重新导入 store.py / manager_provider.py，"
+                "请完整停止并重启 AstrBot；backends.json 数据无需删除。",
+                "；".join(problems),
+            )
         logger.info("LLM Manager 插件已加载，配置仓库：%s", data_dir / "backends.json")
 
     async def terminate(self) -> None:
@@ -431,10 +480,13 @@ class LLMManagerPlugin(Star):
         # 优先用 event.is_admin()（AstrBot 内置判断）
         try:
             attr = getattr(event, "is_admin", None)
-            if callable(attr):
-                if attr():
-                    return True
-            elif attr:
+            result = attr() if callable(attr) else attr
+            if inspect.isawaitable(result):
+                # 某些版本可能改成 async；协程对象恒为真，不能直接当作 True
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+            elif result:
                 return True
         except Exception:
             pass
@@ -445,6 +497,11 @@ class LLMManagerPlugin(Star):
             fn = getattr(self.context, "get_bot_config", None)
             if callable(fn):
                 bot_config = fn()
+            if inspect.isawaitable(bot_config):
+                close = getattr(bot_config, "close", None)
+                if callable(close):
+                    close()
+                bot_config = None
             if bot_config is None:
                 bot_config = getattr(self.context, "astrbot_config", None) or {}
             admins_id = bot_config.get("admins_id", []) or []
@@ -922,9 +979,17 @@ class LLMManagerPlugin(Star):
             if not store.set_fallback_cooldown(value):
                 yield event.plain_result("冷却需在 0-3600 秒之间。")
                 return
+            warning = ""
+            if value == 0 and fb["mode"] == "sticky":
+                warning = (
+                    "\n注意：sticky 模式下 0 秒冷却意味着每轮都会先探测主模型；"
+                    "主模型故障时每条消息都要等一次超时才切换。"
+                    "建议保留至少 30 秒，或改用 /llmm fallback mode transient。"
+                )
             yield event.plain_result(
                 f"冷却已设为 {value} 秒。"
                 + ("（已关闭冷却）" if value == 0 else "")
+                + warning
             )
             return
 

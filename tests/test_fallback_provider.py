@@ -239,6 +239,26 @@ class FailoverProviderTest(unittest.TestCase):
         asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-2"))
         self.assertEqual([call[2] for call in FakeBackend.calls], ["m2"])
 
+    def test_degraded_target_without_image_capability_falls_through_to_pool(self):
+        self.store.add_models("A_通用", ["m3"])
+        self.set_modalities("m1", ["text", "image", "tool_use"])
+        self.set_modalities("m2", ["text", "tool_use"])
+        self.set_modalities("m3", ["text", "image", "tool_use"])
+        self.enable_pool(targets=("2", "3"), mode="sticky")
+        FakeBackend.text_failures["m1"] = lambda: HTTPError(503)
+
+        # 先由文本请求建立全局降级：m1 -> m2
+        asyncio.run(self.provider.text_chat(prompt="hi", session_id="sess-1"))
+        self.assertEqual(self.store.degraded_model()["model"], "m2")
+
+        # 图片请求：m2 不支持图片，本次不能粘滞到它，应沿能力匹配的池继续
+        FakeBackend.calls = []
+        asyncio.run(self.provider.text_chat(
+            prompt="hi", session_id="sess-2", image_urls=["https://img.example/a.png"]
+        ))
+
+        self.assertEqual([call[2] for call in FakeBackend.calls], ["m1", "m3"])
+
     def test_sticky_cascades_to_next_pool_entry(self):
         self.enable_pool(mode="sticky")
         FakeBackend.text_failures["m1"] = lambda: HTTPError(503)

@@ -347,6 +347,22 @@ def _is_route_cooling(store: Any, routed: dict[str, Any]) -> bool:
     )
 
 
+def _required_modalities(
+    image_urls: list[str] | None,
+    audio_urls: list[str] | None,
+    func_tool: Any,
+) -> set[str]:
+    """本次请求必须由路由目标支持的能力集合。"""
+    required: set[str] = set()
+    if image_urls:
+        required.add("image")
+    if audio_urls:
+        required.add("audio")
+    if func_tool is not None:
+        required.add("tool_use")
+    return required
+
+
 class LLMManagerProvider(Provider):
     """虚拟 Provider：注册为 `llm_manager` 类型，路由到真实后端。"""
 
@@ -379,21 +395,21 @@ class LLMManagerProvider(Provider):
         self,
         source: dict[str, Any],
         timeout_seconds: int | None = None,
+        model_name: str | None = None,
     ) -> Any:
         """根据 Source 配置实例化 AstrBot 内置 Provider。
 
-        缓存键包含完整后端配置指纹：用户修改 Key、api_base、超时、代理
-        或自定义头后会自动重建，不会继续使用旧连接。
-
-        timeout_seconds 仅在有备选可切时传入，用于覆盖源自身超时，
-        让“主模型卡住”能更快交给故障转移。
+        缓存键包含完整后端配置指纹与模型名：用户修改 Key、api_base、
+        超时、代理或自定义头后会自动重建；同一源下不同模型各自持有
+        实例，避免并发请求互相改写 model 字段。
         """
         cfg = get_store().source_config(source)
         if timeout_seconds and timeout_seconds > 0:
             cfg["timeout"] = int(timeout_seconds)
         fingerprint = json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
         source_id = str(cfg.get("id", ""))
-        key = (source_id, fingerprint)
+        model_key = str(model_name or "")
+        key = (source_id, fingerprint, model_key)
         cached = self._backend_cache.get(key)
         if cached is not None:
             return cached
@@ -412,12 +428,14 @@ class LLMManagerProvider(Provider):
             # 某些 Provider 构造函数只接受一个参数
             backend = cls(cfg)
 
-        # 清掉同一源的旧指纹，避免 Key 轮换后缓存无限增长
+        # 清掉同一源、旧配置指纹的缓存，避免 Key 轮换后缓存无限增长；
+        # 同源同指纹下的其他模型实例保留，互不干扰。
         for cached_key in list(self._backend_cache):
             if (
                 isinstance(cached_key, tuple)
                 and cached_key[0] == source_id
-                and cached_key != key
+                and len(cached_key) >= 2
+                and cached_key[1] != fingerprint
             ):
                 self._backend_cache.pop(cached_key, None)
         self._backend_cache[key] = backend
@@ -496,8 +514,9 @@ class LLMManagerProvider(Provider):
             except Exception:
                 pass
 
-        # 诊断日志：确认模型已应用（受 verbose_routing_log 开关控制）
-        _routing_log(
+        # 诊断日志：确认模型已应用；属于逐请求细节，固定 DEBUG，
+        # 避免 verbose_routing_log 开启时每请求两行 INFO。
+        logger.debug(
             "[LLM Manager] 后端模型已设置 | type=%s model_attr=%r config_model=%r",
             type(backend).__name__,
             getattr(backend, "model", "?"),
@@ -512,12 +531,16 @@ class LLMManagerProvider(Provider):
         store: Any,
         routed: dict[str, Any],
         explicit_model: bool,
+        required_modalities: set[str] | None = None,
     ) -> dict[str, Any]:
         """sticky 模式的全局降级：主模型冷却期间所有会话共用降级模型。
 
         只在“按全局默认路由”的请求上生效；手动 /llmm use -c 与请求显式
         指定的模型优先。主模型冷却结束后自动清除降级状态，下一轮重新从
         主模型开始探测。
+
+        降级目标不满足本次请求的能力要求（图片/音频/工具）时不做全局
+        降级，交给按能力过滤过的正常候选链，避免图片被静默丢弃。
         """
         fb = store.fallback_config()
         if not fb.get("enabled") or fb.get("mode") != "sticky":
@@ -549,13 +572,19 @@ class LLMManagerProvider(Provider):
         if target is None:
             store.clear_degraded()
             return routed
+        required = set(required_modalities or ())
+        if required and not required.issubset(
+            set(target["model_entry"].get("modalities") or [])
+        ):
+            # 保留降级状态给后续纯文本请求使用，本次请求走正常候选链
+            return routed
         if _is_route_cooling(store, target):
             # 降级目标自身已失败并冷却：本轮按池顺序改用下一个未冷却的备选，
             # 避免每次请求都先等它超时一次。
             replacement = next(
                 (
                     entry
-                    for entry in store.resolve_fallback_entries()
+                    for entry in store.resolve_fallback_entries(required)
                     if _route_key(entry) != _route_key(default)
                     and not _is_route_cooling(store, entry)
                 ),
@@ -605,6 +634,7 @@ class LLMManagerProvider(Provider):
         model: str | None,
         session_id: str | None,
         kwargs: dict[str, Any],
+        required_modalities: set[str] | None = None,
     ) -> dict[str, Any]:
         """核心路由：根据 请求模型 / 会话切换 / 全局默认 解析到真实后端。
 
@@ -624,7 +654,9 @@ class LLMManagerProvider(Provider):
         store = get_store()
         routed = store.resolve(req_model=model, umo=umo)
         if routed is not None:
-            routed = self._apply_degraded(store, routed, model is not None)
+            routed = self._apply_degraded(
+                store, routed, model is not None, required_modalities
+            )
 
         # 诊断日志
         default_inst = store.data.get("default_instance", "")
@@ -669,13 +701,7 @@ class LLMManagerProvider(Provider):
         if not fb.get("enabled"):
             return [primary]
 
-        required: set[str] = set()
-        if image_urls:
-            required.add("image")
-        if audio_urls:
-            required.add("audio")
-        if func_tool is not None:
-            required.add("tool_use")
+        required = _required_modalities(image_urls, audio_urls, func_tool)
 
         candidates = [primary]
         seen = {_route_key(primary)}
@@ -816,7 +842,8 @@ class LLMManagerProvider(Provider):
         request_max_retries: int | None = None,
         **kwargs: Any,
     ) -> str:
-        primary = self._route(model, session_id, kwargs)
+        required = _required_modalities(image_urls, audio_urls, func_tool)
+        primary = self._route(model, session_id, kwargs, required)
         store = get_store()
         plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
         # 有备选可切时，不让 AstrBot 核心的多次重试拖住降级：
@@ -865,7 +892,9 @@ class LLMManagerProvider(Provider):
 
             attempted += 1
             try:
-                backend = self._backend_for(routed["source"], delegated_timeout)
+                backend = self._backend_for(
+                    routed["source"], delegated_timeout, routed["model_name"]
+                )
                 self._apply_model_to_backend(backend, routed["model_name"])
                 cur_images, cur_audio, cur_tools = self._filter_by_modalities(
                     routed["model_entry"], image_urls, audio_urls, func_tool
@@ -918,7 +947,8 @@ class LLMManagerProvider(Provider):
         request_max_retries: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        primary = self._route(model, session_id, kwargs)
+        required = _required_modalities(image_urls, audio_urls, func_tool)
+        primary = self._route(model, session_id, kwargs, required)
         store = get_store()
         plan = self._prepare_plan(primary, image_urls, audio_urls, func_tool)
         # 与 text_chat 一致：有备选时单次尝试即降级，超时按插件配置
@@ -966,7 +996,9 @@ class LLMManagerProvider(Provider):
             usage: dict[str, int] | None = None
             visible = False
             try:
-                backend = self._backend_for(routed["source"], delegated_timeout)
+                backend = self._backend_for(
+                    routed["source"], delegated_timeout, routed["model_name"]
+                )
                 self._apply_model_to_backend(backend, routed["model_name"])
                 cur_images, cur_audio, cur_tools = self._filter_by_modalities(
                     routed["model_entry"], image_urls, audio_urls, func_tool
