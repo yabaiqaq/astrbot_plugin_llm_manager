@@ -3,7 +3,7 @@
     "description": "查看、搜索、切换、测速、统计等日常指令是否仅管理员可用。默认开启。",
     "type": "bool",
     "default": true,
-    "hint": "关闭后群内所有成员都可用 /llmm list/search/use/default/stats/test/help（包括全局切换模型）。添加、删除、导入、重建等写操作始终仅管理员可用，请谨慎操作。"
+    "hint": "关闭后群内所有成员都可用 /llmm ls/s/u/d/st/t/h（包括全局切换模型）。添加、删除、导入、重建等写操作始终仅管理员可用，请谨慎操作。"
   },
   "verbose_routing_log": {
     "description": "在 INFO 日志中输出每条请求的路由诊断。",
@@ -20,13 +20,13 @@
       "transient：临时降级，每轮先探测主模型，失败才按备选池降级"
     ],
     "default": "sticky",
-    "hint": "插件启动时按此值设置。运行中可用 /llmm fallback mode 临时切换，重启后仍以这里为准。"
+    "hint": "插件启动时按此值设置。运行中可用 /llmm f mode 临时切换，重启后仍以这里为准。"
   },
   "fallback_cooldown_seconds": {
     "description": "失败模型/源的冷却秒数，0 表示关闭冷却。",
     "type": "int",
     "default": 120,
-    "hint": "插件启动时按此值设置，有效范围 0-3600。sticky 模式下建议不低于 30：设为 0 时每轮都会先探测主模型，主模型故障时每条消息都要等一次超时才切换。运行中可用 /llmm fallback cooldown 临时调整，重启后仍以这里为准。"
+    "hint": "插件启动时按此值设置，有效范围 0-3600。sticky 模式下建议不低于 30：设为 0 时每轮都会先探测主模型，主模型故障时每条消息都要等一次超时才切换。运行中可用 /llmm f cd 临时调整，重启后仍以这里为准。"
   },
   "fallback_timeout_seconds": {
     "description": "故障转移开启且备选池有可切换条目时，每次调用真实后端的超时秒数。",

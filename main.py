@@ -166,6 +166,30 @@ def _command_argv(event: AstrMessageEvent, subcommand: str, fallback: str = "") 
     return fallback.split()
 
 
+def _alias_argv(
+    event: AstrMessageEvent,
+    names: tuple[str, ...],
+    fallback: str = "",
+) -> list[str]:
+    """取 `/llmm <短名>` 之后的参数。
+
+    短名与全称共用同一套参数解析：优先读原始消息，保证多参数完整；
+    调用方已剥掉命令前缀时退回位置参数。
+    """
+    tokens = str(getattr(event, "message_str", "") or "").strip().split()
+    if tokens and tokens[0].lstrip("/／#!").casefold() in names:
+        # 某些调用方会先剥掉 `/llmm`，只留下短名及参数
+        return tokens[1:]
+    for i in range(len(tokens) - 1):
+        head = tokens[i].lstrip("/／#!").casefold()
+        if not head.endswith("llmm"):
+            continue
+        if tokens[i + 1].casefold() in names:
+            return tokens[i + 2:]
+        break
+    return str(fallback or "").split()
+
+
 def _modality_mark(modalities: list[str] | None) -> str:
     """模型能力标记（工具/视觉/语音），用于纯文本列表显示。"""
     marks = []
@@ -246,18 +270,104 @@ def _render_tree(store: Store, umo: str | None = None) -> str:
 
 def _fallback_usage() -> str:
     return (
-        "用法：\n"
-        "  /llmm fallback                       查看开关、模式与备选池\n"
-        "  /llmm fallback add <目标...>          追加备选（目录序号/实例/模型）\n"
-        "  /llmm fallback rm <池序号...>         删除，支持 2-4 区间\n"
-        "  /llmm fallback move <池序号> <新位置> 调整优先级\n"
-        "  /llmm fallback clear confirm          清空并关闭\n"
-        "  /llmm fallback on|off                 启用/停用\n"
-        "  /llmm fallback mode transient|sticky  切换模式（默认 sticky）\n"
-        "  /llmm fallback max 2-5                总尝试次数（含主模型）\n"
-        "  /llmm fallback cooldown 0-3600        冷却秒数，0 关闭\n"
-        "  /llmm fallback check                  静态校验，不调用模型\n"
-        "  /llmm fallback test                   并行测主模型与备选延迟（会真实调用）"
+        "故障转移用法：\n"
+        "（/llmm f 与 /llmm fallback 等价）\n"
+        "  /llmm f                       查看开关、模式与备选池\n"
+        "  /llmm f add <目标...>         追加备选（目录序号/实例/模型）\n"
+        "  /llmm f rm <池序号...>        删除，支持 2-4 区间\n"
+        "  /llmm f mv <池序号> <新位置>  调整优先级\n"
+        "  /llmm f clear confirm         清空并关闭\n"
+        "  /llmm f on|off                启用/停用\n"
+        "  /llmm f mode transient|sticky 切换模式（默认 sticky）\n"
+        "  /llmm f max 2-5               总尝试次数（含主模型）\n"
+        "  /llmm f cd 0-3600             冷却秒数，0 关闭\n"
+        "  /llmm fc | /llmm f c          静态校验，不调用模型\n"
+        "  /llmm ft | /llmm f t          主模型 + 备选并行测速（会真实调用）\n"
+        "旧写法示例：/llmm fallback add 2 与 /llmm f add 2 等价。"
+    )
+
+
+def _short_help() -> str:
+    return (
+        "LLM 供应商管理 · 常用指令\n"
+        "（短名与全称等价，例如 /llmm ls 也可写 /llmm list）\n"
+        "\n"
+        "查看 / 切换\n"
+        "  /llmm ls            列表（卡片图片）\n"
+        "  /llmm ls -t         列表（纯文本，可加关键词过滤）\n"
+        "  /llmm s <关键词>    搜索模型\n"
+        "  /llmm u <序号>      全局切换\n"
+        "  /llmm u <序号> -c   仅当前会话切换\n"
+        "  /llmm u             查看当前生效模型\n"
+        "  /llmm d <序号>      设为全局默认\n"
+        "\n"
+        "测速 / 统计\n"
+        "  /llmm t [序号...]   测试当前或指定模型（最多 10 个）\n"
+        "  /llmm ft            主模型 + 备选并行测速（会真实调用）\n"
+        "  /llmm st [1d|7d|30d|all]  Token 消耗排行\n"
+        "\n"
+        "故障转移\n"
+        "  /llmm f             查看开关、模式与备选池\n"
+        "  /llmm f on|off      启用 / 停用\n"
+        "  /llmm f add <序号...>       加入备选\n"
+        "  /llmm f rm <池序号...>      移除备选\n"
+        "  /llmm f mv <序号> <新位置>  调整优先级\n"
+        "  /llmm f clear confirm       清空并关闭\n"
+        "  /llmm f mode|max|cd         模式 / 尝试上限 / 冷却\n"
+        "  /llmm fc            静态检查，不调用模型\n"
+        "\n"
+        "更多：/llmm h fb · /llmm h setup · /llmm h full"
+    )
+
+
+def _setup_help() -> str:
+    return (
+        "配置与管理（写操作仅管理员）\n"
+        "  /llmm import                  从系统配置导入已有供应商\n"
+        "  /llmm resync                  手动删改供应商后完全重建\n"
+        "  /llmm add <站名> <base_url> <key> [类型]   新增后端源\n"
+        "  /llmm group add <站名> <分组名> [模型...]  新增分组实例\n"
+        "  /llmm group rm|enable|disable <实例id>\n"
+        "  /llmm model add|rm <实例id> <模型id>...   挂载 / 移除模型\n"
+        "  /llmm enable|disable <实例id>   启停实例\n"
+        "  /llmm rm source|instance|model ...  删除\n"
+        "  /llmm h full                  查看完整说明"
+    )
+
+
+def _full_help() -> str:
+    return (
+        "LLM 供应商管理 · 完整指令\n"
+        "三级结构：API Base URL → 实例(站名_分组名) → 模型[全局序号]\n"
+        "短名与全称等价，以下按短名列出。\n"
+        "\n"
+        "查看 / 切换\n"
+        "  /llmm ls | list [关键词] [-t]      三级卡片；-t 纯文本\n"
+        "  /llmm s | search <关键词...>       模型名模糊搜索\n"
+        "  /llmm u | use <序号|模型id|实例id> [-c]   切换；-c 仅本会话\n"
+        "  /llmm u global                     清除会话切换\n"
+        "  /llmm d | default <目标>           设置全局默认\n"
+        "\n"
+        "故障转移\n"
+        "  /llmm f | fallback                 查看状态\n"
+        "  /llmm f add <目标...>              追加备选\n"
+        "  /llmm f rm <池序号...>             删除，支持 1-3 区间\n"
+        "  /llmm f mv <池序号> <新位置>       调整优先级\n"
+        "  /llmm f clear confirm              清空并关闭\n"
+        "  /llmm f on|off                     启用 / 停用\n"
+        "  /llmm f mode transient|sticky      切换模式（默认 sticky）\n"
+        "  /llmm f max 2-5                    总尝试次数（含主模型）\n"
+        "  /llmm f cd 0-3600                  冷却秒数，0 关闭\n"
+        "  /llmm fc | f check                 静态校验，不调用模型\n"
+        "  /llmm ft | f test                  主模型 + 备选并行测速\n"
+        "\n"
+        "统计 / 测速\n"
+        "  /llmm st | stats [1d|7d|30d|all]   Token 消耗排行\n"
+        "  /llmm t | test [目标...]           连通性与时延测试\n"
+        "\n"
+        "管理\n"
+        "  /llmm h setup                      配置与管理指令\n"
+        "配置存放：data/plugin_data/astrbot_plugin_llm_manager/backends.json"
     )
 
 
@@ -352,7 +462,7 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
 
     lines = [
         f"故障转移：{'开启' if enabled else '关闭'}"
-        + ("" if enabled else "（备选池保留，/llmm fallback on 开启）"),
+        + ("" if enabled else "（备选池保留，/llmm f on 开启）"),
         f"模式：{mode}（{mode_text}）",
         f"主模型：{primary_text}",
         f"尝试上限：{attempts}（含主模型） · 冷却：{cooldown_text}",
@@ -379,13 +489,13 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
         lines.append(
             f"当前会话：{override['instance_id']}/{override['model']}（手动切换）"
         )
-        lines.append("  恢复全局默认：/llmm use global")
+        lines.append("  恢复全局默认：/llmm u global")
 
     statuses = store.fallback_status()
     if not statuses:
         lines.extend([
             "",
-            "备选池为空。用 /llmm fallback add <目录序号> 添加。",
+            "备选池为空。用 /llmm f add <目录序号> 添加。",
         ])
         return "\n".join(lines)
 
@@ -408,7 +518,7 @@ def _render_fallback(store: Store, umo: str | None = None) -> str:
             f"{num}  {status}"
         )
     if has_bad:
-        lines.append("失效/停用条目会被跳过，可用 /llmm fallback check 查看详情。")
+        lines.append("失效/停用条目会被跳过，可用 /llmm fc 查看详情。")
     return "\n".join(lines)
 
 
@@ -431,7 +541,7 @@ def _resolve_and_apply(
     item = store.find_in_catalog(target)
     if item is None:
         return (
-            f"未找到目标 {target!r}。可用：模型序号（/llmm list 查看）、模型 ID、"
+            f"未找到目标 {target!r}。可用：模型序号（/llmm ls 查看）、模型 ID、"
             "实例 ID（站名_分组名）。"
         )
 
@@ -444,7 +554,7 @@ def _resolve_and_apply(
     return f"已全局切换到 [{item['num']}] {item['model']}（{item['instance_id']}）。"
 
 
-@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.0.9")
+@register(PLUGIN_NAME, "yabaiqaq", "LLM 供应商三级管理插件：统一后端、分组与模型切换", "3.1.0")
 class LLMManagerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -585,6 +695,20 @@ class LLMManagerPlugin(Star):
             except OSError:
                 pass
 
+    # ---------- /llmm ls | l（/llmm list 短名）----------
+
+    @llmm.command("ls")
+    async def llm_ls(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("ls", "l", "list"), arg)
+        async for result in self.llm_list(event, " ".join(argv)):
+            yield result
+
+    @llmm.command("l")
+    async def llm_l_short(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("l", "ls", "list"), arg)
+        async for result in self.llm_list(event, " ".join(argv)):
+            yield result
+
     # ---------- /llmm search ----------
 
     @llmm.command("search")
@@ -598,9 +722,9 @@ class LLMManagerPlugin(Star):
         query = " ".join(_command_argv(event, "search", arg)).strip()
         if not query:
             yield event.plain_result(
-                "用法：/llmm search <模型名关键词>\n"
-                "例：/llmm search deepseek\n"
-                "例：/llmm search qwen 72b（多个关键词需全部命中，忽略大小写）"
+                "用法：/llmm s <模型名关键词>\n"
+                "例：/llmm s deepseek\n"
+                "例：/llmm s qwen 72b（多个关键词需全部命中，忽略大小写）"
             )
             return
 
@@ -609,7 +733,7 @@ class LLMManagerPlugin(Star):
         if not items:
             yield event.plain_result(
                 f"未找到模型名匹配 {query!r} 的模型。\n"
-                "可缩短关键词重试，或用 /llmm list 查看已导入的模型。"
+                "可缩短关键词重试，或用 /llmm ls 查看已导入的模型。"
             )
             return
 
@@ -628,7 +752,7 @@ class LLMManagerPlugin(Star):
                 f"{_modality_mark(item['modalities'])}{status}\n"
                 f"  站点：{item['site']} · 分组：{item['instance_id']}"
             )
-        lines.append("序号与 /llmm list 一致，可用 /llmm use <序号> 切换。")
+        lines.append("序号与 /llmm ls 一致，可用 /llmm u <序号> 切换。")
         if render_catalog_image is None:
             yield event.plain_result(
                 "Pillow 不可用，已回退纯文本。\n" + "\n".join(lines)
@@ -650,6 +774,14 @@ class LLMManagerPlugin(Star):
                 os.unlink(img_path)
             except OSError:
                 pass
+
+    # ---------- /llmm s（/llmm search 短名）----------
+
+    @llmm.command("s")
+    async def llm_s(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("s", "search"), arg)
+        async for result in self.llm_search(event, " ".join(argv)):
+            yield result
 
     # ---------- /llmm use ----------
 
@@ -685,14 +817,14 @@ class LLMManagerPlugin(Star):
                     + (f" / {default_model}" if default_model else " / 实例首个模型"),
                     f"  会话切换：{override_text}",
                     "",
-                    "用法：/llmm use <序号|模型id|实例id> [-c]",
-                    "  不带 -c：全局切换；带 -c：仅当前会话；use global 恢复全局默认。",
+                    "用法：/llmm u <序号|模型id|实例id> [-c]（全称 /llmm use 等价）",
+                    "  不带 -c：全局切换；带 -c：仅当前会话；u global 恢复全局默认。",
                 ]
                 if not default_inst and not override:
                     lines.append("")
                     lines.append(
                         "⚠️ 未设置全局默认，当前用的是兜底（第一个启用模型）。"
-                        "建议 /llmm default <序号> 设定。"
+                        "建议 /llmm d <序号> 设定。"
                     )
                 yield event.plain_result("\n".join(lines))
             else:
@@ -700,6 +832,14 @@ class LLMManagerPlugin(Star):
             return
 
         yield event.plain_result(_resolve_and_apply(store, event, tokens[0], conv_only))
+
+    # ---------- /llmm u（/llmm use 短名）----------
+
+    @llmm.command("u")
+    async def llm_u(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("u", "use"), arg)
+        async for result in self.llm_use(event, " ".join(argv)):
+            yield result
 
     # ---------- /llmm default ----------
 
@@ -727,6 +867,14 @@ class LLMManagerPlugin(Star):
             f"全局默认已设为 [{item['num']}] {item['model']}（{item['instance_id']}）。"
         )
 
+    # ---------- /llmm d（/llmm default 短名）----------
+
+    @llmm.command("d")
+    async def llm_d(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("d", "default"), arg)
+        async for result in self.llm_default(event, " ".join(argv)):
+            yield result
+
     # ---------- /llmm fallback ----------
 
     @llmm.command("fallback")
@@ -741,10 +889,14 @@ class LLMManagerPlugin(Star):
         params = tokens[1:]
         aliases = {
             "status": "list", "show": "list",
+            "s": "list", "st": "list",
             "enable": "on", "disable": "off",
             "del": "rm", "remove": "rm", "delete": "rm",
             "latency": "test", "ping": "test", "speed": "test",
-            "延迟": "test", "测速": "test",
+            "t": "test", "延迟": "test", "测速": "test",
+            "c": "check",
+            "cd": "cooldown",
+            "mv": "move",
         }
         action = aliases.get(raw_action, raw_action) or "list"
 
@@ -753,7 +905,7 @@ class LLMManagerPlugin(Star):
         }
         if action in write_actions and not self._is_bot_admin(event):
             yield event.plain_result(
-                "此操作仅管理员可用。查看配置请用 /llmm fallback。"
+                "此操作仅管理员可用。查看配置请用 /llmm f。"
             )
             return
 
@@ -768,9 +920,9 @@ class LLMManagerPlugin(Star):
         if action == "add":
             if not params:
                 yield event.plain_result(
-                    "用法：/llmm fallback add <目录序号|实例/模型|模型名>...\n"
-                    "例：/llmm fallback add 2 3\n"
-                    "目标与 /llmm use 相同，按给出顺序追加到池尾。"
+                    "用法：/llmm f add <目录序号|实例/模型|模型名>...\n"
+                    "例：/llmm f add 2 3\n"
+                    "目标与 /llmm u 相同，按给出顺序追加到池尾。"
                 )
                 return
 
@@ -798,17 +950,17 @@ class LLMManagerPlugin(Star):
             lines.append(_render_fallback(store, event.unified_msg_origin))
             if result["added"] and not result["enabled"]:
                 lines.append("")
-                lines.append("提示：故障转移尚未开启，执行 /llmm fallback on 生效。")
+                lines.append("提示：故障转移尚未开启，执行 /llmm f on 生效。")
             yield event.plain_result("\n".join(lines))
             return
 
         if action == "rm":
             if not params:
                 yield event.plain_result(
-                    "用法：/llmm fallback rm <池序号...>\n"
-                    "例：/llmm fallback rm 2\n"
-                    "例：/llmm fallback rm 1-3\n"
-                    "池序号以 /llmm fallback 显示为准，不是 /llmm list 的目录序号。"
+                    "用法：/llmm f rm <池序号...>\n"
+                    "例：/llmm f rm 2\n"
+                    "例：/llmm f rm 1-3\n"
+                    "池序号以 /llmm f 显示为准，不是 /llmm ls 的目录序号。"
                 )
                 return
 
@@ -842,8 +994,8 @@ class LLMManagerPlugin(Star):
             pool = store.fallback_config()["pool"]
             if len(params) != 2 or not all(p.isdigit() for p in params):
                 yield event.plain_result(
-                    "用法：/llmm fallback move <池序号> <新位置>\n"
-                    f"例：/llmm fallback move 3 1（把第 3 条提到最前，当前 {len(pool)} 条）"
+                    "用法：/llmm f mv <池序号> <新位置>\n"
+                    f"例：/llmm f mv 3 1（把第 3 条提到最前，当前 {len(pool)} 条）"
                 )
                 return
             index, new_index = int(params[0]), int(params[1])
@@ -869,7 +1021,7 @@ class LLMManagerPlugin(Star):
             if not params or params[0].casefold() not in ("confirm", "确认"):
                 yield event.plain_result(
                     f"这会清空 {count} 条备选并关闭故障转移。\n"
-                    "确认请执行：/llmm fallback clear confirm"
+                    "确认请执行：/llmm f clear confirm"
                 )
                 return
             cleared = store.clear_fallback()
@@ -890,14 +1042,14 @@ class LLMManagerPlugin(Star):
                     return
                 if not store.set_fallback_enabled(True):
                     yield event.plain_result(
-                        "备选池为空，无法开启。先 /llmm fallback add <目录序号> 添加。"
+                        "备选池为空，无法开启。先 /llmm f add <目录序号> 添加。"
                     )
                     return
                 lines = ["故障转移已开启。"]
                 if not store.resolve_fallback_entries():
                     lines.append(
                         "注意：池内没有可解析的条目，运行时不会发生转移。"
-                        "用 /llmm fallback check 查看。"
+                        "用 /llmm fc 查看。"
                     )
             else:
                 if not fb["enabled"]:
@@ -921,7 +1073,7 @@ class LLMManagerPlugin(Star):
                     "  transient：每轮先试主模型，失败才临时降级（推荐）\n"
                     "  sticky：主模型失败时全局降级到备选池首个可用模型，\n"
                     "          主模型冷却结束后自动回到主模型\n"
-                    "用法：/llmm fallback mode transient|sticky"
+                    "用法：/llmm f mode transient|sticky"
                 )
                 return
             mode = params[0].casefold()
@@ -933,7 +1085,7 @@ class LLMManagerPlugin(Star):
                 yield event.plain_result(
                     "已切换为 sticky：主模型失败时全局降级到备选池首个可用模型，"
                     "后续备选依次顶替；主模型冷却结束后自动回到主模型。"
-                    "手动 /llmm use -c 的会话不受影响。"
+                    "手动 /llmm u -c 的会话不受影响。"
                 )
             else:
                 yield event.plain_result(
@@ -947,7 +1099,7 @@ class LLMManagerPlugin(Star):
             if not params:
                 yield event.plain_result(
                     f"当前尝试上限：{fb['max_attempts']} 次（含主模型）。\n"
-                    "用法：/llmm fallback max 2-5"
+                    "用法：/llmm f max 2-5"
                 )
                 return
             try:
@@ -968,7 +1120,7 @@ class LLMManagerPlugin(Star):
             if not params:
                 yield event.plain_result(
                     f"当前冷却：{fb['cooldown_seconds']} 秒。\n"
-                    "用法：/llmm fallback cooldown 0-3600（0 表示关闭冷却）"
+                    "用法：/llmm f cd 0-3600（0 表示关闭冷却）"
                 )
                 return
             try:
@@ -984,7 +1136,7 @@ class LLMManagerPlugin(Star):
                 warning = (
                     "\n注意：sticky 模式下 0 秒冷却意味着每轮都会先探测主模型；"
                     "主模型故障时每条消息都要等一次超时才切换。"
-                    "建议保留至少 30 秒，或改用 /llmm fallback mode transient。"
+                    "建议保留至少 30 秒，或改用 /llmm f mode transient。"
                 )
             yield event.plain_result(
                 f"冷却已设为 {value} 秒。"
@@ -997,7 +1149,7 @@ class LLMManagerPlugin(Star):
             statuses = store.fallback_status()
             if not statuses:
                 yield event.plain_result(
-                    "备选池为空。用 /llmm fallback add <目录序号> 添加。"
+                    "备选池为空。用 /llmm f add <目录序号> 添加。"
                 )
                 return
             lines = ["备选池检查（未调用模型）："]
@@ -1095,12 +1247,32 @@ class LLMManagerPlugin(Star):
             lines.append(f"—— {success_count}/{len(results)} 成功 ——")
             if skipped:
                 lines.append(
-                    f"已跳过 {skipped} 条失效/停用备选（/llmm fallback check 查看）"
+                    f"已跳过 {skipped} 条失效/停用备选（/llmm fc 查看）"
                 )
             yield event.plain_result("\n".join(lines))
             return
 
         yield event.plain_result(_fallback_usage())
+
+    # ---------- /llmm f | ft | fc（/llmm fallback 短名）----------
+
+    @llmm.command("f")
+    async def llm_f(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("f", "fallback"), arg)
+        async for result in self.llm_fallback(event, " ".join(argv)):
+            yield result
+
+    @llmm.command("ft")
+    async def llm_ft(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("ft",), arg)
+        async for result in self.llm_fallback(event, " ".join(["test", *argv])):
+            yield result
+
+    @llmm.command("fc")
+    async def llm_fc(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("fc",), arg)
+        async for result in self.llm_fallback(event, " ".join(["check", *argv])):
+            yield result
 
     # ---------- /llmm add ----------
 
@@ -1192,15 +1364,15 @@ class LLMManagerPlugin(Star):
         elif result.get("original_default"):
             lines.append(
                 f"  ⚠️ 原默认模型 {result['original_default']} 未在目录中匹配到，"
-                "请用 /llmm default <序号> 手动设置。"
+                "请用 /llmm d <序号> 手动设置。"
             )
         else:
             lines.append(
                 "  ⚠️ 未检测到原默认模型（default_provider_id / agent_runner 均为空），"
-                "当前用兜底模型，建议 /llmm default <序号> 设置。"
+                "当前用兜底模型，建议 /llmm d <序号> 设置。"
             )
 
-        lines.append("\n用 /llmm list 查看，/llmm use <序号> 切换。")
+        lines.append("\n用 /llmm ls 查看，/llmm u <序号> 切换。")
         yield event.plain_result("\n".join(lines))
 
     # ---------- /llmm resync ----------
@@ -1250,7 +1422,7 @@ class LLMManagerPlugin(Star):
             lines.append("  ✅ 全局默认模型已保留")
         else:
             lines.append(
-                "  ⚠️ 原全局默认模型已不存在，已清空（用 /llmm default <序号> 重新设置）"
+                "  ⚠️ 原全局默认模型已不存在，已清空（用 /llmm d <序号> 重新设置）"
             )
         if result["overrides_cleaned"]:
             lines.append(f"  已清理 {result['overrides_cleaned']} 个无效会话切换")
@@ -1258,7 +1430,7 @@ class LLMManagerPlugin(Star):
             lines.append(f"  跳过（非聊天模型）：{', '.join(result['skipped'])}")
         if result.get("backup_file"):
             lines.append(f"  原配置已备份为：{result['backup_file']}")
-        lines.append("\n用 /llmm list 查看最新配置。")
+        lines.append("\n用 /llmm ls 查看最新配置。")
         yield event.plain_result("\n".join(lines))
 
     # ---------- /llmm group ----------
@@ -1411,7 +1583,7 @@ class LLMManagerPlugin(Star):
                 "  /llmm rm source <站名|源id>   删除一级源（含所有分组和模型）\n"
                 "  /llmm rm instance <实例id>     删除实例\n"
                 "  /llmm rm model <实例id> <模型id>  删除模型\n"
-                "注意：删除后立即生效，用 /llmm list 查看。"
+                "注意：删除后立即生效，用 /llmm ls 查看。"
             )
             return
 
@@ -1427,10 +1599,10 @@ class LLMManagerPlugin(Star):
             if ok:
                 yield event.plain_result(
                     f"已删除一级源 {target}（含其下所有分组和模型）。\n"
-                    "用 /llmm list 查看最新配置。"
+                    "用 /llmm ls 查看最新配置。"
                 )
             else:
-                yield event.plain_result(f"未找到一级源 {target}（用 /llmm list 查看站名/源id）。")
+                yield event.plain_result(f"未找到一级源 {target}（用 /llmm ls 查看站名/源id）。")
             return
 
         if sub == "instance":
@@ -1524,10 +1696,18 @@ class LLMManagerPlugin(Star):
         if fallback_calls:
             lines.append(f"其中降级响应: {fallback_calls} 次")
         lines.append("")
-        lines.append("提示: /llmm stats 1d | 7d | 30d | all  切换时间范围")
+        lines.append("提示: /llmm st 1d | 7d | 30d | all  切换时间范围")
         lines.append("（流式对话需提供商返回 usage 才会记录）")
 
         yield event.plain_result("\n".join(lines))
+
+    # ---------- /llmm st（/llmm stats 短名）----------
+
+    @llmm.command("st")
+    async def llm_st(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("st", "stats"), arg)
+        async for result in self.llm_stats(event, " ".join(argv)):
+            yield result
 
     # ---------- /llmm test ----------
 
@@ -1637,7 +1817,7 @@ class LLMManagerPlugin(Star):
         if not items:
             yield event.plain_result(
                 f"未找到任何目标：{', '.join(not_found)}\n"
-                "用法：/llmm test <序号|模型id|实例id>...（/llmm list 查看序号）"
+                "用法：/llmm t <序号|模型id|实例id>...（/llmm ls 查看序号）"
             )
             return
 
@@ -1668,6 +1848,14 @@ class LLMManagerPlugin(Star):
         lines.append(f"—— {success_count}/{len(results)} 成功 ——")
         yield event.plain_result("\n".join(lines))
 
+    # ---------- /llmm t（/llmm test 短名）----------
+
+    @llmm.command("t")
+    async def llm_t(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("t", "test"), arg)
+        async for result in self.llm_test(event, " ".join(argv)):
+            yield result
+
     # ---------- /llmm help ----------
 
     @llmm.command("help")
@@ -1677,36 +1865,23 @@ class LLMManagerPlugin(Star):
             yield deny
             return
 
-        help_text = (
-            "LLM 供应商管理插件\n"
-            "三级结构：API Base URL → 实例(站名_分组名) → 模型[全局序号]\n\n"
-            "查看/切换：\n"
-            "  /llmm list [关键词] [-t]      三级卡片图片查看；-t 纯文本\n"
-            "  /llmm search <模型名关键词>   模糊搜索并返回卡片图片；多关键词全部匹配\n"
-            "  /llmm use <序号|模型id|实例id> [-c]   全局切换；-c 仅当前会话\n"
-            "  /llmm use global            清除会话切换，回到全局默认\n"
-            "  /llmm default <目标>        设置全局默认模型/实例\n"
-            "故障转移（管理员配置，查看跟随 admin_only）：\n"
-            "  /llmm fallback              查看开关、模式与备选池\n"
-            "  /llmm fallback add <目标...>   添加备选（目录序号/实例/模型）\n"
-            "  /llmm fallback rm <池序号...>  删除，支持 1-3 区间\n"
-            "  /llmm fallback move <序号> <新位置>   调整优先级\n"
-            "  /llmm fallback clear confirm   清空并关闭\n"
-            "  /llmm fallback on|off       启用/停用\n"
-            "  /llmm fallback mode transient|sticky\n"
-            "  /llmm fallback max 2-5      总尝试次数（含主模型）\n"
-            "  /llmm fallback cooldown 0-3600   冷却秒数\n"
-            "  /llmm fallback check        静态校验，不调用模型\n"
-            "  /llmm fallback test         并行测主模型与备选延迟（会真实调用）\n"
-            "管理（管理员）：\n"
-            "  /llmm import                 从系统配置(cmd_config.json)导入已有供应商\n"
-            "  /llmm add <站名> <base_url> <key> [类型]   新增后端源\n"
-            "  /llmm group add <站名> <分组名> [模型...]   新增分组实例\n"
-            "  /llmm group rm|enable|disable <实例id>\n"
-            "  /llmm model add|rm <实例id> <模型id>...    挂载/移除模型\n"
-            "运维：\n"
-            "  /llmm stats [1d|7d|30d|all]  各模型 Token 消耗排行\n"
-            "  /llmm test <目标>           连通性与时延测试\n"
-            "配置存放：data/plugin_data/astrbot_plugin_llm_manager/backends.json"
-        )
-        yield event.plain_result(help_text)
+        argv = _command_argv(event, "help", arg)
+        topic = argv[0].casefold() if argv else ""
+        if topic in ("full", "all", "全部"):
+            yield event.plain_result(_full_help())
+            return
+        if topic in ("fb", "fallback", "故障转移", "转移"):
+            yield event.plain_result(_fallback_usage())
+            return
+        if topic in ("setup", "admin", "管理", "配置"):
+            yield event.plain_result(_setup_help())
+            return
+        yield event.plain_result(_short_help())
+
+    # ---------- /llmm h（/llmm help 短名）----------
+
+    @llmm.command("h")
+    async def llm_h(self, event: AstrMessageEvent, arg: str = ""):
+        argv = _alias_argv(event, ("h", "help"), arg)
+        async for result in self.llm_help(event, " ".join(argv)):
+            yield result

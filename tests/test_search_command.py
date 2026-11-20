@@ -88,7 +88,7 @@ class SearchCommandTest(unittest.TestCase):
 
     def test_empty_query(self):
         output, = self.run_command("   ")
-        self.assertIn("用法：/llmm search", output)
+        self.assertIn("用法：/llmm s", output)
 
     def test_no_match(self):
         output, = self.run_command("nonexistent")
